@@ -8,12 +8,32 @@ static int numPcore;
 
 static DecreSet decSet;
 static ExecutionSlice eSlice;
+static ExecutionSlice exePlan;
+
+/*
+outputSlices()
+	output the contents of all slices
+*/
+void outputSlices(ExecutionSlice* currSlice){	
+	while(currSlice->next != NULL){
+		for(int i=0;i<numPcore; i++){
+			if(currSlice->next->mapping[i] != -1){
+				fprintf(stdout,"%d ", currSlice->next->mapping[i]);
+			}
+			else{
+				fprintf(stdout,"x ", currSlice->next->mapping[i]);
+			}		
+		}
+		fprintf(stdout,"| %d\n", currSlice->next->timeslice);
+		currSlice = currSlice->next;
+	};
+}
 
 /*
 assginJob()
 	find a match in phase 2
 */
-bool assginJob(int* matching, int MachNum){//, Machine* machines){
+bool assginJob(int* matching, int MachNum){
 	bool findAns = false;
 
 	if(MachNum == numPcore){
@@ -61,14 +81,9 @@ bool assginJob(int* matching, int MachNum){//, Machine* machines){
 
 	return findAns;
 }
-
-
-
-
-
 /*
 compareSlice()
-	compare if two execution slices is the same
+	compare if two execution slices are the same
 */
 bool compareSlice(int* target, int* obj, int size){
 	bool match = true;
@@ -79,6 +94,51 @@ bool compareSlice(int* target, int* obj, int size){
 		}	
 	}
 	return match;
+}
+
+
+/*
+computeInc()
+	compute the increases of the number of switching if inserting the current slice
+*/
+int computeInc(ExecutionSlice* currSlice, int* roadMap){
+	int inc = 0;
+	int vCore = 0;
+	for(int i=0;i<numPcore;i++){
+		vCore = currSlice->mapping[i];
+		if((vCore != -1) && (roadMap[vCore] != -1) && (roadMap[vCore] != i)){
+			inc++;
+		}
+	}
+	return inc;
+}
+/*
+interaction()
+
+*/
+int interaction(ExecutionSlice* slice){
+	int times = 0;
+	int vCore = 0;
+	int* tempMap = (int*)malloc(sizeof(int)*numVcore);
+	ExecutionSlice* currSlice = eSlice.next;
+
+	for(int i=0;i<numVcore;i++){
+		tempMap[i] = -1;
+	}
+	for(int i=0;i<numPcore;i++){
+		vCore = slice->mapping[i];
+		if(vCore != -1){
+			tempMap[vCore] = i;
+		}
+	}
+	while(currSlice != NULL){
+		times += computeInc(currSlice, tempMap);
+		currSlice = currSlice->next;
+	};
+
+	free(tempMap);
+
+	return times;
 }
 
 /*
@@ -283,22 +343,8 @@ int phase2(){
 			distinctES++;
 		}
 	};
-
-	/*
-	ExecutionSlice* currSlice = &eSlice;
-	while(currSlice->next != NULL){
-		for(int i=0;i<numPcore; i++){
-			if(currSlice->next->mapping[i] != -1){
-				fprintf(stdout,"%d ", currSlice->next->mapping[i]);
-			}
-			else{
-				fprintf(stdout,"x ", currSlice->next->mapping[i]);
-			}		
-		}
-		fprintf(stdout,"| %d\n", currSlice->next->timeslice);
-		currSlice = currSlice->next;
-	};
-	*/
+	
+	//outputSlices(&eSlice);	
 
 	// clean up
 	free(decSet.MachPicked);
@@ -310,6 +356,81 @@ int phase2(){
 	free(vcoreLoad);
 
 	return distinctES;
+}
+
+/*
+phase 3
+
+*/
+int phase3(){
+	
+	int numSwitching = 0;
+	int minIncrease = 0;
+	int* roadMap = (int*)malloc(sizeof(int)*numVcore);
+
+	ExecutionSlice* currSlice;
+	ExecutionSlice* candSlice;
+
+	ExecutionSlice* planTail = &exePlan;
+
+	for(int i = 0;i<numVcore;i++){
+		roadMap[i] = -1;
+	}
+	
+	while(eSlice.next != NULL){
+		// find the execution slice with the least marginal number of swtiching
+		candSlice = eSlice.next;
+		minIncrease = computeInc(candSlice, roadMap);
+		currSlice = candSlice->next;
+		
+		while(currSlice != NULL){
+			// compute increase 
+			int numIncrease = computeInc(currSlice, roadMap); 
+			if(numIncrease < minIncrease){
+				candSlice = currSlice;
+			}
+			else if(numIncrease == minIncrease){
+				if(interaction(candSlice) > interaction(currSlice)){
+					candSlice = currSlice;
+				}
+			}
+			currSlice = currSlice->next;
+		};
+
+		// update current status
+		int vCore = 0;
+		minIncrease += numSwitching;
+		for(int i = 0; i<numPcore; i++){
+			vCore = candSlice->mapping[i];
+			if(vCore != -1){
+				if((roadMap[vCore] != -1) && (roadMap[vCore] != i)){
+					numSwitching++;
+				}
+				roadMap[vCore] = i;
+			}
+		}
+		if(minIncrease != numSwitching){
+			// something wrong
+			fprintf(stderr, "Switching time anomaly\n");
+		}
+
+		// remove from queue
+		candSlice->prev->next = candSlice->next;
+		if(candSlice->next != NULL){
+			candSlice->next->prev = candSlice->prev;
+		}
+		// insert candSlice into plan
+		planTail->next = candSlice;
+		candSlice->prev = planTail;
+		candSlice->next = NULL;
+		planTail = planTail->next;		
+	};
+
+	//outputSlices(&exePlan);
+
+	free(roadMap);
+
+	return numSwitching;
 }
 
 void gen_schedule_plan(){	
@@ -355,6 +476,28 @@ void gen_schedule_plan(){
 	// fetch vcpu and pcpu info
 #endif
 
+
+#ifdef DEVELOPING
+	clock_t t;
+	t = clock();
+	// phase 1
+	phase1();
+	t = clock() - t;
+	fprintf(stderr, "phase 1: %d ticks (%.3lf seconds).\n", t, ((double)t)/CLOCKS_PER_SEC);
+	
+	t = clock();
+	// phase 2
+	eSlice.next = NULL;
+	phase2();
+	t = clock() - t;
+	fprintf(stderr, "phase 2: %d ticks (%.3lf seconds).\n", t, ((double)t)/CLOCKS_PER_SEC);
+
+	t = clock();
+	// phase 3
+	phase3();
+	t = clock() - t;
+	fprintf(stderr, "phase 3: %d ticks (%.3lf seconds).\n", t, ((double)t)/CLOCKS_PER_SEC);
+#else
 	// phase 1
 	phase1();
 
@@ -363,8 +506,8 @@ void gen_schedule_plan(){
 	phase2();
 
 	// phase 3
-
-
+	phase3();
+#endif
 }
 
 

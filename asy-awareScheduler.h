@@ -2,6 +2,7 @@
 #include "cstdlib"
 #include "cstring"
 #include "cmath"
+#include "ctime"
 
 #define	TYPE_BIG	0
 #define	TYPE_LITTLE	1
