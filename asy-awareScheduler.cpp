@@ -7,6 +7,7 @@ static int numVcore;
 static int numPcore;
 
 static DecreSet decSet;
+static ExecutionSlice eSlice;
 
 /*
 assginJob()
@@ -61,6 +62,24 @@ bool assginJob(int* matching, int MachNum){//, Machine* machines){
 	return findAns;
 }
 
+
+
+
+
+/*
+compareSlice()
+	compare if two execution slices is the same
+*/
+bool compareSlice(int* target, int* obj, int size){
+	bool match = true;
+	for(int i=0;i<size;i++){
+		if(target[i] != obj[i]){
+			match = false;
+			break;
+		}	
+	}
+	return match;
+}
 
 /*
 phase 1()
@@ -139,18 +158,15 @@ double phase1(){
 phase 2()
 	
 */
-void phase2(){
-	
-	int* vcoreLoad = (int*)malloc(sizeof(int)*numVcore);		
+int phase2(){
 	
 	int LowerBound = 0;
+	int* vcoreLoad = (int*)malloc(sizeof(int)*numVcore);	
+	int* matching = (int*)malloc(sizeof(int)*numPcore);
+	ExecutionSlice* newSlice;
+	int distinctES = 0;
 
 	// init
-	/*
-	for(int i = 0;i < numPcore;i++){
-		pcoreContainer[i]->load = 0;
-	}
-	*/
 	for(int i = 0;i < numVcore;i++){
 		vcoreLoad[i] = 0;
 	}		
@@ -160,6 +176,10 @@ void phase2(){
 			vcoreLoad[j] += pcoreContainer[i]->workload[j];
 		}
 	}
+	decSet.JobTight = (bool*)malloc(sizeof(bool)*numVcore);
+	decSet.MachTight = (bool*)malloc(sizeof(bool)*numPcore);
+	decSet.JobPicked = (bool*)malloc(sizeof(bool)*numVcore);
+	decSet.MachPicked = (bool*)malloc(sizeof(bool)*numPcore);
 
 	while(1){	
 		// find LB	
@@ -179,13 +199,8 @@ void phase2(){
 			break;
 		}
 
-		// find decreSet
+		// init decreSet
 		decSet.delta = LowerBound;
-		decSet.JobTight = (bool*)malloc(sizeof(bool)*numVcore);
-		decSet.MachTight = (bool*)malloc(sizeof(bool)*numPcore);
-		decSet.JobPicked = (bool*)malloc(sizeof(bool)*numVcore);
-		decSet.MachPicked = (bool*)malloc(sizeof(bool)*numPcore);
-			
 		for(int i = 0; i < numVcore;i++){
 			decSet.JobTight[i] = false;
 			decSet.JobPicked[i] = false;
@@ -194,7 +209,7 @@ void phase2(){
 			decSet.MachTight[i] = false;
 			decSet.MachPicked[i] = false;
 		}
-
+		// find a decreSet
 		for(int i = 0;i < numPcore;i++){
 			if(pcoreContainer[i]->load == LowerBound){
 				decSet.MachTight[i] = true;
@@ -218,8 +233,7 @@ void phase2(){
 			}
 		}
 
-		// pick matching
-		int *matching = (int*)malloc(sizeof(int)*numPcore);		
+		// pick a matching		
 		if(!assginJob(matching,0)){
 			// something wrong
 			fprintf(stderr,"!!!\n");
@@ -232,18 +246,70 @@ void phase2(){
 			}
 		}
 
-		// execute job
-		for(int i = 0;i< numPcore; i++){
+		// reduct workload
+		for(int i = 0;i < numPcore; i++){
 			if(matching[i] != -1){
 				pcoreContainer[i]->workload[matching[i]] -= decSet.delta;
 				pcoreContainer[i]->load -= decSet.delta;
 				vcoreLoad[matching[i]] -= decSet.delta;
 			}			
-		}	
+		}
+
+		// create an execution slice
+		newSlice = (ExecutionSlice*)malloc(sizeof(ExecutionSlice));
+		newSlice->timeslice = decSet.delta;
+		newSlice->mapping = (int*)malloc(sizeof(int)*numPcore);
+		memcpy(newSlice->mapping, matching, sizeof(int)*numPcore);
+
+		// add to the list of execution slice
+		ExecutionSlice* currSlice = &eSlice;
+		while(currSlice->next != NULL){
+			// compare
+			if(compareSlice(currSlice->next->mapping, newSlice->mapping, numPcore)){
+				// if the same
+				currSlice->next->timeslice += newSlice->timeslice;
+				free(newSlice->mapping);
+				free(newSlice);
+				break;
+			}
+			else{
+				currSlice = currSlice->next;
+			}
+		};
+		if(currSlice->next == NULL){			
+			newSlice->prev = currSlice;
+			newSlice->next = NULL;
+			currSlice->next = newSlice;
+			distinctES++;
+		}
 	};
 
-	
-	free(vcoreLoad);	
+	/*
+	ExecutionSlice* currSlice = &eSlice;
+	while(currSlice->next != NULL){
+		for(int i=0;i<numPcore; i++){
+			if(currSlice->next->mapping[i] != -1){
+				fprintf(stdout,"%d ", currSlice->next->mapping[i]);
+			}
+			else{
+				fprintf(stdout,"x ", currSlice->next->mapping[i]);
+			}		
+		}
+		fprintf(stdout,"| %d\n", currSlice->next->timeslice);
+		currSlice = currSlice->next;
+	};
+	*/
+
+	// clean up
+	free(decSet.MachPicked);
+	free(decSet.JobPicked);
+	free(decSet.MachTight);
+	free(decSet.JobTight);
+
+	free(matching);
+	free(vcoreLoad);
+
+	return distinctES;
 }
 
 void gen_schedule_plan(){	
@@ -293,6 +359,7 @@ void gen_schedule_plan(){
 	phase1();
 
 	// phase 2
+	eSlice.next = NULL;
 	phase2();
 
 	// phase 3

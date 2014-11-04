@@ -1,5 +1,6 @@
 #include "cstdio"
 #include "cstdlib"
+#include "cstring"
 #include "cmath"
 
 #define	TYPE_BIG	0
@@ -33,4 +34,11 @@ struct DecreSet{
 	bool* JobTight;
 	bool* MachPicked;
 	bool* JobPicked;
+};
+
+struct ExecutionSlice{
+	int timeslice;
+	int* mapping;
+	ExecutionSlice* prev;
+	ExecutionSlice* next;
 };
