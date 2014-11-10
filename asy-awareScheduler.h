@@ -1,7 +1,7 @@
 #include "cstdio"
 #include "cstdlib"
 #include "cstring"
-#include "cmath"
+//#include "cmath"
 #include "ctime"
 
 #define	TYPE_BIG	0

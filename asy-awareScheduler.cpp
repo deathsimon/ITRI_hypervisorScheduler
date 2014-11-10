@@ -199,8 +199,10 @@ double phase1(){
 		double res_remain = target_pcore->freq*(1-((double)target_pcore->load/(double)TIMESLICE));
 		if(res_remain >= vcoreContainer[i]->requ*scale){
 			double percentage = vcoreContainer[i]->requ*scale/target_pcore->freq;
-			target_pcore->workload[vcoreContainer[i]->code] = (int)ceil(percentage*TIMESLICE);
-			target_pcore->load += (int)ceil(percentage*TIMESLICE);
+			//target_pcore->workload[vcoreContainer[i]->code] = (int)ceil(percentage*TIMESLICE);
+			target_pcore->workload[vcoreContainer[i]->code] = (int)(percentage*TIMESLICE);
+			//target_pcore->load += (int)ceil(percentage*TIMESLICE);
+			target_pcore->load += (int)(percentage*TIMESLICE);
 			vcoreContainer[i]->requ = 0;
 		}
 		else{
@@ -432,7 +434,6 @@ int phase3(){
 
 	return numSwitching;
 }
-
 void gen_schedule_plan(){	
 	
 #ifdef DEVELOPING
@@ -508,8 +509,25 @@ void gen_schedule_plan(){
 	// phase 3
 	phase3();
 #endif
-}
 
+	// clean up
+	ExecutionSlice* target;
+	while(exePlan.next != NULL){
+		target = exePlan.next;
+		exePlan.next = exePlan.next->next;
+		free(target);
+	};
+
+	for(int i=0;i<numPcore;i++){
+		free(pcoreContainer[i]);
+	}
+	free(pcoreContainer);
+
+	for(int i=0;i<numVcore;i++){
+		free(vcoreContainer[i]);
+	}
+	free(vcoreContainer);
+}
 
 int main(){
 
