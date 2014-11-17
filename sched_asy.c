@@ -20,6 +20,9 @@
 #define	ASYM_TIMESLICE_MS			10		/* timeslice = 10 ms	*/
 #define ASYM_INTERVAL_TS			100		/* interval = 100 timeslice	*/
 
+#define	TYPE_PERFORMANCE			0
+#define	TYPE_EFFICIENCY				1
+
 /*
  * Useful macros
  */
@@ -39,6 +42,8 @@
  */
 struct asym_pcpu {
 	struct list_head runq;
+	
+	struct list_head type_elem;
 	
     unsigned int curr_slice;	/* record current time slice in an interval	*/
 };
@@ -77,10 +82,15 @@ struct asym_private {
     
 	struct list_head sdom;    
 	/* global timer that triggers the scheduling algorithm */
-    struct timer  timer_gen_plan;
-    unsigned int master;
+    struct timer timer_gen_plan;
+    /* physical core	*/
+	unsigned int master;
+	struct list_head perf_cores;
+	uint32_t amount_perf_core;
+	struct list_head effi_cores;
+	uint32_t int amount_effi_core;
     	
-    cpumask_var_t cpus;       
+    //cpumask_var_t cpus;
 };
 
 /*
@@ -89,12 +99,14 @@ struct asym_private {
 static inline int
 __vcpu_on_runq(struct asym_vcpu *svc)
 {
+	/* list_empty(const struct list_head *head) */
     return !list_empty(&svc->runq_elem);
 }
 
 static inline struct asym_vcpu *
 __runq_elem(struct list_head *elem)
 {
+	/* list_entry(ptr,type,member) */
     return list_entry(elem, struct asym_vcpu, runq_elem);
 }
 
@@ -107,13 +119,14 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
     BUG_ON( __vcpu_on_runq(svc) );
     BUG_ON( cpu != svc->vcpu->processor );
 
+	/* ist_for_each(pos, head)  */
     list_for_each( iter, runq )
     {
         const struct asym_vcpu * const iter_svc = __runq_elem(iter);
 		/* insert according to the start_time of the vcpu	*/
         if ( svc->start_time < iter_svc->start_time )
             break;
-    }
+    }	
 	list_add_tail(&svc->runq_elem, iter);
 }
 
@@ -132,13 +145,103 @@ __runq_tickle(unsigned int cpu, struct csched_vcpu *new)
 	 * do something here.
      */   	
 }
+/*
+	TODO: get the type of a pcpu
+	Victor: To get the physical CPU type info, you can access it in Xen by get part_number field from MIDR register with current_cpu_data.midr.part_number
+*/
+static inline int
+__fetch_core_type(unsigned int cpu)
+{
+	unsigned int type = UINT_MAX;
+	/*
+	()?(type = TYPE_PERFORMANCE):(type = TYPE_EFFICIENCY);
+	*/
+	return type;
+}
 
-/* TODOs */
 static void
-asym_free_pdata(const struct scheduler *ops, void *pcpu, int cpu){}
+asym_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+{
+	struct asym_private *prv = ASYM_PRIV(ops);
+    struct asym_pcpu *spc = pcpu;
+    unsigned long flags;
+
+	if ( spc == NULL )
+        return;
+	
+	spin_lock_irqsave(&prv->lock, flags);
+	
+	// remove the pcpu from the list it belongs
+	list_del_init(&spc->type_elem);
+	
+	/* if target pcpu is the one dedicate to dom0, kill timer */
+	if (prv->master == cpu){					
+		kill_timer(&prv->timer_gen_plan);
+	}
+	else{
+		/* else, update the */
+		if(__fetch_core_type(cpu) == TYPE_EFFICIENCY){
+			prv->amount_effi_core--;
+		}
+		else{		
+			prv->amount_perf_core--;
+		}
+	}		
+	spin_unlock_irqrestore(&prv->lock, flags);
+
+    xfree(spc);
+}
 
 static void *
-asym_alloc_pdata(const struct scheduler *ops, int cpu){}
+asym_alloc_pdata(const struct scheduler *ops, int cpu)
+{
+	struct asym_pcpu *spc;
+    struct asym_private *prv = ASYM_PRIV(ops);
+    unsigned long flags;
+
+    /* Allocate per-PCPU info */
+    spc = xzalloc(struct asym_pcpu);
+    if ( spc == NULL )
+        return NULL;
+
+	spin_lock_irqsave(&prv->lock, flags);
+
+    /* Initialize/update system-wide config */
+	INIT_LIST_HEAD(spc->type_elem);
+		
+	if(__fetch_core_type(cpu) == TYPE_EFFICIENCY){
+		//if this cpu is a power-efficient core
+		if(prv->master == UINT_MAX){
+			// dedicate the core to dom0
+			prv->master = cpu;
+			init_timer(&prv->timer_gen_plan, asym_gen_plan, prv, cpu);
+			set_timer(&prv->timer_gen_plan,
+				NOW() + MILLISECS(ASYM_INTERVAL_TS));		
+		}
+		else{
+			// others
+			list_add_tail(&spc->type_elem,&prv->effi_cores);
+			prv->amount_effi_core++;			
+		}	
+	}
+	else{
+		// or a performance core
+		list_add_tail(&spc->type_elem,&prv->perf_cores);
+		prv->amount_perf_core++;		
+	}	
+
+    INIT_LIST_HEAD(&spc->runq);
+    
+	if ( per_cpu(schedule_data, cpu).sched_priv == NULL )
+        per_cpu(schedule_data, cpu).sched_priv = spc;
+
+    /* Start off idling... */
+    BUG_ON(!is_idle_vcpu(curr_on_cpu(cpu)));    
+
+    spin_unlock_irqrestore(&prv->lock, flags);
+
+    return spc;
+}
 
 static int
 asym_cpu_pick(const struct scheduler *ops, struct vcpu *vc){}
@@ -224,6 +327,25 @@ static int
 asym_init(struct scheduler *ops)
 {
 	/* allocate private data*/
+	struct asym_private *prv;
+
+    prv = xzalloc(struct asym_private);
+    if ( prv == NULL )
+        return -ENOMEM;
+
+	ops->sched_data = prv;
+    spin_lock_init(&prv->lock);
+    INIT_LIST_HEAD(&prv->sdom);
+
+	prv->master = UINT_MAX;	
+	INIT_LIST_HEAD(&prv->perf_cores);
+	INIT_LIST_HEAD(&prv->effi_cores);
+	prv->amount_perf_core = 0;
+	prv->amount_effi_core = 0;
+	
+	printk("Scheduler initialization Successful.\n");
+	
+	return 0;
 }
 
 static void
