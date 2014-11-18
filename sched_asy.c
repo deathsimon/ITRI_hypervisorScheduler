@@ -17,6 +17,9 @@
 /*
  * Basic constants
  */
+#define CORE_AMOUNT					6		/* 0~3: A53, 4~5: A57	*/
+#define AMOUNT_EFFI					4
+
 #define	ASYM_TIMESLICE_MS			10		/* timeslice = 10 ms	*/
 #define ASYM_INTERVAL_TS			100		/* interval = 100 timeslice	*/
 
@@ -40,12 +43,14 @@
 /*
  * Physical CPU
  */
+//DEFINE_PER_CPU(type, name);
+DEFINE_PER_CPU(unsigned int, curr_slice);
 struct asym_pcpu {
 	struct list_head runq;
+	struct timer ticker;
+	unsigned int type;
 	
-	struct list_head type_elem;
-	
-    unsigned int curr_slice;	/* record current time slice in an interval	*/
+    //unsigned int curr_slice;	/* record current time slice in an interval	*/
 };
 
 /*
@@ -58,6 +63,7 @@ struct asym_vcpu {
     struct asym_dom *sdom;
     struct vcpu *vcpu;
 	/* excution period on a pcpu	*/
+	unsigned int target_cpu;
 	unsigned int start_slice;
 	unsigned int end_slice;
 		
@@ -69,7 +75,7 @@ struct asym_vcpu {
  */
 struct asym_dom {
     struct list_head vcpu;		/* link its VCPUs	*/
-    struct list_head sdom_elem;	/* link list on rt_priv	*/
+    struct list_head sdom_elem;	/* link list on asym_priv	*/
     struct domain *dom;			/* pointer to upper domain	*/
 };
 
@@ -85,13 +91,13 @@ struct asym_private {
     struct timer timer_gen_plan;
     /* physical core	*/
 	unsigned int master;
-	struct list_head perf_cores;
-	uint32_t amount_perf_core;
-	struct list_head effi_cores;
-	uint32_t int amount_effi_core;
+	struct asym_pcpu* cpuArray[CORE_AMOUNT];
     	
     //cpumask_var_t cpus;
 };
+
+static void asym_tick(void *_cpu);
+static void asym_gen_plan(void *dummy);
 
 /*
  * Inline functions from credit-base scheduler
@@ -119,7 +125,8 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
     BUG_ON( __vcpu_on_runq(svc) );
     BUG_ON( cpu != svc->vcpu->processor );
 
-	/* ist_for_each(pos, head)  */
+	svc->target_cpu = cpu;
+	/* list_for_each(pos, head)  */
     list_for_each( iter, runq )
     {
         const struct asym_vcpu * const iter_svc = __runq_elem(iter);
@@ -153,9 +160,9 @@ static inline int
 __fetch_core_type(unsigned int cpu)
 {
 	unsigned int type = UINT_MAX;
-	/*
-	()?(type = TYPE_PERFORMANCE):(type = TYPE_EFFICIENCY);
-	*/
+	/* for JUNO board	*/
+	(cpu >= AMOUNT_EFFI)?(type = TYPE_PERFORMANCE):(type = TYPE_EFFICIENCY);
+	
 	return type;
 }
 
@@ -171,22 +178,14 @@ asym_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
 	
 	spin_lock_irqsave(&prv->lock, flags);
 	
-	// remove the pcpu from the list it belongs
-	list_del_init(&spc->type_elem);
+	/* remove the pcpu from the pcpu array */
+	prv->cpuArray[cpu] = NULL;
 	
-	/* if target pcpu is the one dedicate to dom0, kill timer */
-	if (prv->master == cpu){					
+	kill_timer(&spc->ticker);
+	if (prv->master == cpu){
 		kill_timer(&prv->timer_gen_plan);
 	}
-	else{
-		/* else, update the */
-		if(__fetch_core_type(cpu) == TYPE_EFFICIENCY){
-			prv->amount_effi_core--;
-		}
-		else{		
-			prv->amount_perf_core--;
-		}
-	}		
+
 	spin_unlock_irqrestore(&prv->lock, flags);
 
     xfree(spc);
@@ -208,28 +207,22 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 
     /* Initialize/update system-wide config */
 	INIT_LIST_HEAD(spc->type_elem);
-		
-	if(__fetch_core_type(cpu) == TYPE_EFFICIENCY){
-		//if this cpu is a power-efficient core
-		if(prv->master == UINT_MAX){
-			// dedicate the core to dom0
-			prv->master = cpu;
-			init_timer(&prv->timer_gen_plan, asym_gen_plan, prv, cpu);
-			set_timer(&prv->timer_gen_plan,
-				NOW() + MILLISECS(ASYM_INTERVAL_TS));		
-		}
-		else{
-			// others
-			list_add_tail(&spc->type_elem,&prv->effi_cores);
-			prv->amount_effi_core++;			
-		}	
+	/* set timer	*/
+	if(cpu == prv->master){
+		init_timer(&prv->timer_gen_plan, asym_gen_plan, prv, cpu);
+		set_timer(&prv->timer_gen_plan,
+			NOW() + MILLISECS(ASYM_INTERVAL_TS*ASYM_TIMESLICE_MS));		
 	}
-	else{
-		// or a performance core
-		list_add_tail(&spc->type_elem,&prv->perf_cores);
-		prv->amount_perf_core++;		
-	}	
-
+	init_timer(&spc->ticker, asym_tick, (void *)(unsigned long)cpu, cpu);
+    set_timer(&spc->ticker, NOW() + MICROSECS(ASYM_TIMESLICE_MS) );		
+	/* set type	*/
+	spc->type = __fetch_core_type(cpu);	
+	/* set per-CPU timeslice	*/
+	get_cpu_var(sockets_in_use) = 0;
+	put_cpu_var(sockets_in_use);
+	
+	prv->cpuArray[cpu] = spc;
+	/* Initialize runqueue	*/
     INIT_LIST_HEAD(&spc->runq);
     
 	if ( per_cpu(schedule_data, cpu).sched_priv == NULL )
@@ -244,50 +237,222 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 }
 
 static int
-asym_cpu_pick(const struct scheduler *ops, struct vcpu *vc){}
-
+asym_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
+{
+	/* TODO ??? */	
+}
 static void *
-asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd){}
+asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
+{
+	struct asym_vcpu *svc;
+
+    /* Allocate per-VCPU info */
+    svc = xzalloc(struct asym_vcpu);
+    if ( svc == NULL )
+        return NULL;
+
+    INIT_LIST_HEAD(&svc->runq_elem);
+    INIT_LIST_HEAD(&svc->sdom_elem);
+    svc->sdom = dd;
+    svc->vcpu = vc;
+	/*
+	svc->target_cpu = UINT_MIN;
+    svc->start_slice = UINT_MIN;
+	svc->end_slice = UINT_MIN;
+	*/
+
+	SCHED_STAT_CRANK(vcpu_init);
+    
+    return svc;
+}
 
 static void
-asym_vcpu_insert(const struct scheduler *ops, struct vcpu *vc){}
+asym_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+{
+    struct asym_vcpu *svc = vc->sched_priv;
+
+    if ( !__vcpu_on_runq(svc) && vcpu_runnable(vc) && !vc->is_running )
+        __runq_insert(vc->processor, svc);
+
+	/* if this vcpu belong does not belong to any dom, somethings wrong */
+	if(!list_empty(&svc->sdom_elem))
+		list_add_tail(&svc->sdom_elem, &svc->sdom->vcpu);	
+}
 
 static void
-asym_free_vdata(const struct scheduler *ops, void *priv){}
+asym_free_vdata(const struct scheduler *ops, void *priv)
+{
+	struct asym_vcpu *svc = priv;
+
+    BUG_ON( !list_empty(&svc->runq_elem) );
+
+    xfree(svc);
+}
 
 static void
-asym_vcpu_remove(const struct scheduler *ops, struct vcpu *vc){}
+asym_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
+{	
+    struct asym_vcpu * const svc = ASYM_VCPU(vc);
+    struct asym_dom * const sdom = svc->sdom;
+    unsigned long flags;
+
+	SCHED_STAT_CRANK(vcpu_destroy);
+
+	if ( __vcpu_on_runq(svc) )
+        __runq_remove(svc);
+
+    if ( !list_empty(&svc->sdom_elem) ){
+		/* remove the vcpu from domain	*/
+		list_del_init(&svc->sdom_elem);
+	}	    
+
+    BUG_ON( sdom == NULL );
+    BUG_ON( !list_empty(&svc->runq_elem) );
+}
 
 static void
-asym_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc){}
+asym_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
+{
+	struct asym_vcpu * const svc = ASYM_VCPU(vc);
+
+    SCHED_STAT_CRANK(vcpu_sleep);
+
+    BUG_ON( is_idle_vcpu(vc) );
+
+	if ( curr_on_cpu(vc->processor) == vc )
+		/* if running on pcpu	*/
+        cpu_raise_softirq(vc->processor, SCHEDULE_SOFTIRQ);	
+    else if ( __vcpu_on_runq(svc) )
+		/* only on runqueue	*/
+        __runq_remove(svc);
+}
 
 static void
-asym_vcpu_wake(const struct scheduler *ops, struct vcpu *vc){}
+asym_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
+{
+	struct asym_vcpu * const svc = ASYM_VCPU(vc);
+    const unsigned int cpu = vc->processor;
+
+	BUG_ON( is_idle_vcpu(vc) );
+
+	if ( unlikely(curr_on_cpu(cpu) == vc) )
+    {
+        SCHED_STAT_CRANK(vcpu_wake_running);
+        return;
+    }
+    if ( unlikely(__vcpu_on_runq(svc)) )
+    {
+        SCHED_STAT_CRANK(vcpu_wake_onrunq);
+        return;
+    }
+
+    if ( likely(vcpu_runnable(vc)) )
+        SCHED_STAT_CRANK(vcpu_wake_runnable);
+    else
+        SCHED_STAT_CRANK(vcpu_wake_not_runnable);
+
+	/* Put the VCPU into the runq	*/
+	__runq_insert(cpu, svc);
+	/* TODO    
+    __runq_tickle(cpu, svc);	
+	*/
+}
 
 static void
-asym_vcpu_yield(const struct scheduler *ops, struct vcpu *vc){}
+asym_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
+{
+	/* TODO	*/
+}
 
 static int
 asym_dom_cntl(
     const struct scheduler *ops,
     struct domain *d,
-	struct xen_domctl_scheduler_op *op){}
+	struct xen_domctl_scheduler_op *op)
+{
+	/* TODO	*/	
+}
 
 static int
 asym_sys_cntl(const struct scheduler *ops,
-                        struct xen_sysctl_scheduler_op *sc){}
+                        struct xen_sysctl_scheduler_op *sc)
+{
+	/* TODO	*/						
+}
 
+/* Domain related actions	*/
 static void *
-asym_alloc_domdata(const struct scheduler *ops, struct domain *dom){}
+asym_alloc_domdata(const struct scheduler *ops, struct domain *dom)
+{
+	unsigned long flags;
+    struct asym_dom *sdom;
+    struct asym_private * prv = ASYM_PRIV(ops);
+
+    sdom = xzalloc(struct asym_dom);
+    if ( sdom == NULL )
+        return NULL;
+    
+    INIT_LIST_HEAD(&sdom->vcpu);
+    INIT_LIST_HEAD(&sdom->sdom_elem);
+    sdom->dom = dom;
+
+	/* spinlock here to insert the dom */
+    spin_lock_irqsave(&prv->lock, flags);
+    list_add_tail(&sdom->sdom_elem, &(prv->sdom));
+    spin_unlock_irqrestore(&prv->lock, flags);
+
+    return (void *)sdom;
+}
 
 static int
-asym_dom_init(const struct scheduler *ops, struct domain *dom){}
+asym_dom_init(const struct scheduler *ops, struct domain *dom)
+{
+    struct asym_dom *sdom;
+
+    if ( is_idle_domain(dom) )
+        return 0;
+
+    sdom = asym_alloc_domdata(ops, dom);
+    if ( sdom == NULL )
+        return -ENOMEM;
+
+    dom->sched_priv = sdom;
+
+    return 0;
+}
 
 static void
-asym_free_domdata(const struct scheduler *ops, void *data){}
+asym_free_domdata(const struct scheduler *ops, void *data)
+{
+	unsigned long flags;
+    struct asym_dom *sdom = data;
+    struct asym_private *prv = ASYM_PRIV(ops);
+
+    spin_lock_irqsave(&prv->lock, flags);
+    list_del_init(&sdom->sdom_elem);
+    spin_unlock_irqrestore(&prv->lock, flags);
+	xfree(data);
+}
 
 static void
-asym_dom_destroy(const struct scheduler *ops, struct domain *dom){}
+asym_dom_destroy(const struct scheduler *ops, struct domain *dom)
+{
+	asym_free_domdata(ops, ASYM_DOM(dom));
+}
+
+/* Increase current slice number of each physical core	*/
+static void
+asym_tick(void *_cpu)
+{
+	unsigned int cpu = (unsigned long)_cpu;
+	struct asym_pcpu *spc = ASYM_PCPU(cpu);
+    
+	/* spc->curr_slice++	*/
+	get_cpu_var(curr_slice)++;
+	put_cpu_var(curr_slice);
+        
+    set_timer(&spc->ticker, NOW() + MICROSECS(ASYM_TIMESLICE_MS) );
+}
 
 /*
  * This function is in the critical path. It is designed to be simple and
@@ -297,6 +462,9 @@ static struct task_slice
 asym_schedule(
     const struct scheduler *ops, s_time_t now, bool_t tasklet_work_scheduled)
 {
+	/* TODO */
+	SCHED_STAT_CRANK(schedule);
+
     /* First check the current cpu is master(for dom0 only) or the others.	*/
 
 	/* If dom0, apply a round-robin fashion to execute the vcpus from dom0*/
@@ -306,22 +474,35 @@ asym_schedule(
 	 * If the end_time is larger, the next vcpu = the current one.
 	 * Else, migrate the vcpu to the next pcpu according to the scheduling plan,
 	 * and fetch the next vcpu from run queue.
+	 
+	 if(last_cpu->target_cpu != this_cpu){query and migrate}
+
 	 *
 	 * If its start_time is less or equal to curr_slice, start the execution
 	 * else, idle for a time slice
 	 *
-	 * curr_slice++
+	 *
+	 return ret;
 	 */
 }
 
 static void
-asym_dump_vcpu(struct csched_vcpu *svc){}
+asym_dump_vcpu(struct csched_vcpu *svc)
+{
+	/* TODO */
+}
 
 static void
-asym_dump_pcpu(const struct scheduler *ops, int cpu){}
+asym_dump_pcpu(const struct scheduler *ops, int cpu)
+{
+	/* TODO */
+}
 
 static void
-asym_dump(const struct scheduler *ops){}
+asym_dump(const struct scheduler *ops)
+{
+	/* TODO */
+}
 
 static int
 asym_init(struct scheduler *ops)
@@ -337,12 +518,13 @@ asym_init(struct scheduler *ops)
     spin_lock_init(&prv->lock);
     INIT_LIST_HEAD(&prv->sdom);
 
-	prv->master = UINT_MAX;	
-	INIT_LIST_HEAD(&prv->perf_cores);
-	INIT_LIST_HEAD(&prv->effi_cores);
-	prv->amount_perf_core = 0;
-	prv->amount_effi_core = 0;
-	
+	/* array of ptr to physical cores */
+	prv->master = 0;
+	int i = 0;
+	for( i = 0 ; i < CORE_AMOUNT; i++){
+		cpuArray[i] = NULL;
+	}
+		
 	printk("Scheduler initialization Successful.\n");
 	
 	return 0;
