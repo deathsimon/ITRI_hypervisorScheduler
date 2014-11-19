@@ -48,8 +48,7 @@ DEFINE_PER_CPU(unsigned int, curr_slice);
 struct asym_pcpu {
 	struct list_head runq;
 	struct timer ticker;
-	unsigned int type;
-	
+	unsigned int type;	
     //unsigned int curr_slice;	/* record current time slice in an interval	*/
 };
 
@@ -145,24 +144,23 @@ __runq_remove(struct asym_vcpu *svc)
 }
 
 static inline void
-__runq_tickle(unsigned int cpu, struct csched_vcpu *new)
+__runq_tickle(unsigned int cpu, struct asym_vcpu *new)
 {
-    /* TODO
-     * After inserting a vcpu to the runqueue of a pcpu, 
-	 * do something here.
-     */   	
+    /* After inserting a vcpu to the runqueue of a pcpu, 
+	 * raise softirq to tell the cpu to re-schedule.
+	 */
+	cpu_raise_softirq(cpu, SCHEDULE_SOFTIRQ);   	
 }
-/*
-	TODO: get the type of a pcpu
-	Victor: To get the physical CPU type info, you can access it in Xen by get part_number field from MIDR register with current_cpu_data.midr.part_number
-*/
+/*	get the type of a pcpu	*/
 static inline int
 __fetch_core_type(unsigned int cpu)
 {
 	unsigned int type = UINT_MAX;
 	/* for JUNO board	*/
 	(cpu >= AMOUNT_EFFI)?(type = TYPE_PERFORMANCE):(type = TYPE_EFFICIENCY);
-	
+	/* for general cases, 
+	 * Victor: To get the physical CPU type info, you can access it in Xen by get part_number field from MIDR register with current_cpu_data.midr.part_number
+	 */	
 	return type;
 }
 
@@ -206,7 +204,7 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 	spin_lock_irqsave(&prv->lock, flags);
 
     /* Initialize/update system-wide config */
-	INIT_LIST_HEAD(spc->type_elem);
+	
 	/* set timer	*/
 	if(cpu == prv->master){
 		init_timer(&prv->timer_gen_plan, asym_gen_plan, prv, cpu);
@@ -239,7 +237,14 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 static int
 asym_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
 {
-	/* TODO ??? */	
+	/* Since the scheduling plan already decides which cpus a vcpu can run on,
+	 * pick_cpu only return the current physical cpu of the vcpu.
+	 */
+	int cpu;
+
+	cpu = vc->processor;
+
+	return cpu;
 }
 static void *
 asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
@@ -260,7 +265,7 @@ asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
     svc->start_slice = UINT_MIN;
 	svc->end_slice = UINT_MIN;
 	*/
-
+	SCHED_VCPU_STATS_RESET(svc);
 	SCHED_STAT_CRANK(vcpu_init);
     
     return svc;
@@ -351,17 +356,19 @@ asym_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
     else
         SCHED_STAT_CRANK(vcpu_wake_not_runnable);
 
-	/* Put the VCPU into the runq	*/
+	/* Put the VCPU into the runq, and tirgger the re-scheduling on the cpu	*/
 	__runq_insert(cpu, svc);
-	/* TODO    
-    __runq_tickle(cpu, svc);	
-	*/
+	__runq_tickle(cpu, svc);	
 }
 
 static void
 asym_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
 {
-	/* TODO	*/
+	/* one solution is to switch the execution slice with another vcpu
+	 * that will not violate the constraints of the scheduling plan.
+	 * However, this is too complicate.
+	 * Therefore, do nothing for now.
+	 */
 }
 
 static int
@@ -370,14 +377,43 @@ asym_dom_cntl(
     struct domain *d,
 	struct xen_domctl_scheduler_op *op)
 {
-	/* TODO	*/	
+	struct asym_dom * const sdom = ASYM_DOM(d);
+    struct asym_vcpu *svc;
+    struct list_head *iter;
+
+	printk("Here we are in asym_dom_cntl()\n"
+		   "\tcmd:%d\n",op->cmd););
+
+	/* ???
+    switch ( op->cmd )
+    {
+    case XEN_DOMCTL_SCHEDOP_getinfo:
+		break;
+    case XEN_DOMCTL_SCHEDOP_putinfo:		
+        break;
+    }
+	*/
+
+    return 0;
 }
 
 static int
 asym_sys_cntl(const struct scheduler *ops,
                         struct xen_sysctl_scheduler_op *sc)
 {
-	/* TODO	*/						
+	printk("Here we are in asym_sys_cntl()\n"
+		   "\tcmd:%d\n",sc->cmd);
+
+	/* ???		
+    switch ( sc->cmd )
+    {
+    case XEN_SYSCTL_SCHEDOP_putinfo:
+		break;
+	case XEN_SYSCTL_SCHEDOP_getinfo:
+		break;
+	}
+	*/
+	return 0;
 }
 
 /* Domain related actions	*/
@@ -462,9 +498,16 @@ static struct task_slice
 asym_schedule(
     const struct scheduler *ops, s_time_t now, bool_t tasklet_work_scheduled)
 {
-	/* TODO */
+	const int cpu = smp_processor_id();
+    struct list_head * const runq = RUNQ(cpu);
+    struct asym_vcpu * const scurr = ASYM_VCPU(current);	/* can us "current" directly?	*/
+    struct asym_private *prv = ASYM_PRIV(ops);
+    struct asym_vcpu *snext;
+    struct task_slice ret;
+	
 	SCHED_STAT_CRANK(schedule);
 
+	/* TODO */
     /* First check the current cpu is master(for dom0 only) or the others.	*/
 
 	/* If dom0, apply a round-robin fashion to execute the vcpus from dom0*/
@@ -477,25 +520,75 @@ asym_schedule(
 	 
 	 if(last_cpu->target_cpu != this_cpu){query and migrate}
 
-	 *
-	 * If its start_time is less or equal to curr_slice, start the execution
-	 * else, idle for a time slice
-	 *
-	 *
-	 return ret;
 	 */
+	/* If its start_time is less or equal to curr_slice, start the execution
+	 * else, idle for a time slice
+	 */
+	if(snext->vcpu->start_time <= curr_slice){
+		ret.time = ASYM_TIMESLICE_MS; 
+		ret.task = snext->vcpu;
+	else{
+		ret.time = -1; 
+		ret.task = ;
+	}	
+	 
+	return ret;	 
 }
 
 static void
-asym_dump_vcpu(struct csched_vcpu *svc)
+asym_dump_vcpu(struct asym_vcpu *svc)
 {
-	/* TODO */
+	ASSERT(svc != NULL);
+    /* idle vcpu */
+    if( svc->sdom == NULL )
+    {
+        printk("\n");
+        return;
+    }
+
+    printk("[%i.%i] target_cpu=%i timeslice=(%i,%i) curr_cpu=%i\n",
+            svc->vcpu->domain->domain_id,
+            svc->vcpu->vcpu_id,
+            svc->target_cpu,
+            svc->start_slice,
+			svc->end_slice,
+            svc->vcpu->processor);    
 }
 
 static void
 asym_dump_pcpu(const struct scheduler *ops, int cpu)
 {
-	/* TODO */
+	struct list_head *runq, *iter;
+    struct asym_pcpu *spc;
+    struct asym_vcpu *svc;
+    int loop;
+#define cpustr keyhandler_scratch
+
+    spc = ASYM_PCPU(cpu);
+    runq = &spc->runq;
+
+	cpumask_scnprintf(cpustr, sizeof(cpustr), per_cpu(cpu_core_mask, cpu));
+    printk("core=%s\n", cpustr);
+
+	/* current VCPU */
+    svc = ASYM_VCPU(curr_on_cpu(cpu));
+    if ( svc )
+    {
+        printk("\trun: ");
+        asym_dump_vcpu(svc);
+    }
+	/* VCPU the runqueue*/
+    loop = 0;
+    list_for_each( iter, runq )
+    {
+        svc = __runq_elem(iter);
+        if ( svc )
+        {
+            printk("\t%3d: ", ++loop);
+            asym_dump_vcpu(svc);
+        }
+    }
+#undef cpustr
 }
 
 static void
