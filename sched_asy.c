@@ -262,9 +262,10 @@ asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
     svc->vcpu = vc;
 	/*
 	svc->target_cpu = UINT_MIN;
-    svc->start_slice = UINT_MIN;
-	svc->end_slice = UINT_MIN;
 	*/
+	/*	[start, end] = [0, ASYM_INTERVAL_TS]*/
+    svc->start_slice = UINT_MIN;
+	svc->end_slice = ASYM_INTERVAL_TS;
 	SCHED_VCPU_STATS_RESET(svc);
 	SCHED_STAT_CRANK(vcpu_init);
     
@@ -477,6 +478,13 @@ asym_dom_destroy(const struct scheduler *ops, struct domain *dom)
 }
 
 /* Increase current slice number of each physical core	*/
+
+static void
+asym_gen_plan(void *dummy){
+	
+
+}
+
 static void
 asym_tick(void *_cpu)
 {
@@ -507,31 +515,54 @@ asym_schedule(
 	
 	SCHED_STAT_CRANK(schedule);
 
-	/* TODO */
-    /* First check the current cpu is master(for dom0 only) or the others.	*/
-
-	/* If dom0, apply a round-robin fashion to execute the vcpus from dom0*/
-
-	/* else, compare the end_time of current running vcpu with the curr_slice
-	 *
+	/* First, compare the end_time of current running vcpu with the curr_slice
 	 * If the end_time is larger, the next vcpu = the current one.
 	 * Else, migrate the vcpu to the next pcpu according to the scheduling plan,
 	 * and fetch the next vcpu from run queue.
-	 
-	 if(last_cpu->target_cpu != this_cpu){query and migrate}
-
 	 */
-	/* If its start_time is less or equal to curr_slice, start the execution
-	 * else, idle for a time slice
-	 */
-	if(snext->vcpu->start_time <= curr_slice){
-		ret.time = ASYM_TIMESLICE_MS; 
-		ret.task = snext->vcpu;
+	
+	/* Tasklet work (which runs in idle VCPU context) overrides all else. */
+    if ( tasklet_work_scheduled )
+    {       
+        snext = ASYM_VCPU(idle_vcpu[cpu]);        
+    }
+	else if( !(scurr->vcpu == idle_vcpu[cpu])
+		&& (scurr->end_time >= per_cpu(curr_slice, cpu))){
+		snext = scurr;
+        ret.migrated = 0;        
+	}
 	else{
-		ret.time = -1; 
-		ret.task = ;
-	}	
-	 
+		/* check where the next pcpu the current vcpu should go */
+		//scurr->target_cpu = query_plan(scurr->vcpu);
+		if(scurr->target_cpu == prv->master){
+			/* nowhere to go */
+			/* TODO	*/
+		}
+		else if(scurr->target_cpu == cpu){
+			__runq_insert();			
+		}
+		else{
+			/* migrate to target pcpu*/
+			scurr->vcpu->processor = scurr->target_cpu;
+			set_bit(_VPF_migrating, &scurr->vcpu->pause_flags);
+		}
+		
+		/*
+		* Select next runnable local VCPU (ie top of local runq)
+		*/
+		snext = __runq_elem(runq->next);
+		ret.migrated = 0;
+		ret.time = ASYM_TIMESLICE_MS; 
+		/* If its start_time is less or equal to curr_slice, start the execution
+		 * else, idle for a time slice
+		 */
+		if(snext->vcpu->start_time <= curr_slice){			
+			ret.task = snext->vcpu;
+		else{			
+			ret.task = idle_vcpu[cpu];
+		}	
+	}
+		 
 	return ret;	 
 }
 
@@ -594,7 +625,43 @@ asym_dump_pcpu(const struct scheduler *ops, int cpu)
 static void
 asym_dump(const struct scheduler *ops)
 {
-	/* TODO */
+	struct list_head *iter_sdom, *iter_svc;
+    struct asym_private *prv = ASYM_PRIV(ops);
+	struct asym_dom *sdom;
+	struct asym_vcpu *svc;
+    int loop;
+    unsigned long flags;
+
+    spin_lock_irqsave(&(prv->lock), flags);
+
+	printk("Global RunQueue info:\n");
+
+    printk("info:\n"
+           "\tmaster						= %u\n"
+		   "\tlength of timeslice(msec)		= %d\n"
+		   "\t# of tslice in an interval	= %d\n",
+		   prv->master,
+           ASYM_TIMESLICE_MS,
+		   ASYM_INTERVAL_TS);
+
+	//printk("active vcpus:\n");
+	printk("Domain info:\n");
+    loop = 0;
+    list_for_each( iter_sdom, &prv->sdom )
+    {
+        sdom = list_entry(iter_sdom, struct asym_dom, sdom_elem);
+		printk("\tdomain: %d\n", sdom->dom->domain_id);
+
+        list_for_each( iter_svc, &sdom->vcpu )
+        {
+            svc = list_entry(iter_svc, struct asym_vcpu, sdom_elem);
+
+            printk("\t%3d: ", ++loop);
+            asym_dump_vcpu(svc);
+        }
+    }
+
+    spin_unlock_irqrestore(&(prv->lock), flags);
 }
 
 static int
