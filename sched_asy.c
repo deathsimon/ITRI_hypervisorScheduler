@@ -48,7 +48,11 @@ DEFINE_PER_CPU(unsigned int, curr_slice);
 struct asym_pcpu {
 	struct list_head runq;
 	struct timer ticker;
+	/* for scheduling algorithm*/
 	unsigned int type;	
+	unsigned int prov_resouce;
+	unsigned int load;
+	unsigned int* workloads;
     //unsigned int curr_slice;	/* record current time slice in an interval	*/
 };
 
@@ -61,6 +65,10 @@ struct asym_vcpu {
 	/* Up-pointers	*/
     struct asym_dom *sdom;
     struct vcpu *vcpu;
+	/* for scheduling algorithm*/
+	unsigned int sched_code;
+	unsigned int requ_resouce;
+	struct list_head act_elem;
 	/* excution period on a pcpu	*/
 	unsigned int target_cpu;
 	unsigned int start_slice;
@@ -95,8 +103,24 @@ struct asym_private {
     //cpumask_var_t cpus;
 };
 
+/*
+ * DecSet in Phase 2
+ */
+struct asym_decSet{
+	int delta;
+	bool* MachTight;
+	bool* JobTight;
+	bool* MachPicked;
+	bool* JobPicked;
+};
+struct asym_exeSlice{
+	int timeslice;
+	int* mapping;
+	struct list_head plan_elem;
+};
+
 static void asym_tick(void *_cpu);
-static void asym_gen_plan(void *dummy);
+static void asym_gen_plan(const struct scheduler *ops);
 
 /*
  * Inline functions from credit-base scheduler
@@ -163,6 +187,14 @@ __fetch_core_type(unsigned int cpu)
 	 */	
 	return type;
 }
+static inline int
+__fetch_vcore_frequ(struct vcpu *vcpu){
+	/* TODO	*/	
+}
+static inline int
+__fetch_pcore_frequ(unsigned int cpu){
+	/* TODO	*/
+}
 
 static void
 asym_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
@@ -218,6 +250,8 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 	/* set per-CPU timeslice	*/
 	get_cpu_var(sockets_in_use) = 0;
 	put_cpu_var(sockets_in_use);
+
+	workloads = NULL;
 	
 	prv->cpuArray[cpu] = spc;
 	/* Initialize runqueue	*/
@@ -260,6 +294,7 @@ asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
     INIT_LIST_HEAD(&svc->sdom_elem);
     svc->sdom = dd;
     svc->vcpu = vc;
+	INIT_LIST_HEAD(&svc->act_elem);
 	/*
 	svc->target_cpu = UINT_MIN;
 	*/
@@ -479,10 +514,259 @@ asym_dom_destroy(const struct scheduler *ops, struct domain *dom)
 
 /* Increase current slice number of each physical core	*/
 
-static void
-asym_gen_plan(void *dummy){
-	
+/* The physica core efficieness	*/
+static inline double
+__pcpu_effi(struct asym_pcpu *spc){
+	/* For now, justify accroding to core type	*/	
+	return (double)spc->type;
+}
+static inline void
+__dump_plan(){
 
+}
+static void
+asym_gen_plan(const struct scheduler *ops){
+	struct asym_private *prv = ASYM_PRIV(ops);
+	struct asym_dom *sdom;
+	struct asym_vcpu *svc;
+	struct asym_pcpu *candidate;
+	struct list_head active_vcpu;
+	struct list_head *iter_sdom, *iter_svc;
+
+	unsigned int amountPCPU;
+	unsigned int amountVCPU = 0, dom0VCPU = 0;
+	unsigned int i, j;
+	unsigned int candidate;
+	double prov, requ;
+	double total_prov = 0.0, total_requ = 0.0;
+	double scale;
+
+	INIT_LIST_HEAD(active_vcpu);
+
+	/* First, fetch the frequencies of the vCPUs,
+	 * and compute the total resource required
+	 */	
+	/* change to list_for_each_entry(type *cursor, struct list_head *list, member) ?*/	
+	list_for_each( iter_sdom, &prv->sdom ){
+		/* list_entry(ptr,type,member) */
+		sdom = list_entry(iter_sdom, struct asym_dom, sdom_elem);
+
+		if(sdom->dom->dom_id == 0){
+			dom0VCPU++;
+		}
+		else{
+			list_for_each( iter_svc, &sdom->vcpu )
+			{
+				svc = list_entry(iter_svc, struct asym_vcpu, sdom_elem);
+				requ = __fetch_vcore_frequ(svc->vcpu)
+				svc->requ_resouce = requ;
+				total_requ += requ;
+				INIT_LIST_HEAD(&svc->act_elem);
+				list_add_tail(&svc->act_elem, active_vcpu);
+				svc->sched_code = amountVCPU;
+				amountVCPU++;
+			}
+        }
+	}	
+
+	/* Then fetch the frequencies of the vCPUs,
+	 * and compute the total resource required.
+	 * Also allocate the memory of vCPUs on each pCPU
+	 */	
+	for(i = 0; i < CORE_AMOUNT; i++){
+		if((i != prv->master) 
+			&& (prv->cpuArray[CORE_AMOUNT] != NULL)){
+			prv->cpuArray[i]->load = 0;
+			prov = __fetch_pcore_frequ(i);
+			prv->cpuArray[i]->prov_resouce = prov;
+			total_prov += prov;
+			workloads = xzalloc_array(unsigned int, amountVCPU);
+			amountPCPU++;
+		}
+	}	
+
+	/* Phase 1
+	/* compute scale factor
+	 * scale = 1: the current physical core setting can process all the virtual core requirements
+	 * scale < 1: scale down the virtual core requirements
+	 */
+	(total_prov >= total_requ)?(scale = 1):(scale = total_prov/total_requ);
+
+	/* Greedy Assignment
+	 * Assign vcpu to the most "efficient" pcpu with load less than 100%
+	 */
+	iter_svc = active_vcpu->next;
+	while( iter_svc != active_vcpu )
+	{
+		svc = list_entry(iter_svc, struct asym_vcpu, sdom_elem);
+		candidate = NULL;
+		for(i = 0; i < CORE_AMOUNT; i++){
+			if(i == prv->master)
+				continue;
+			if(prv->cpuArray[i]->load == ASYM_INTERVAL_TS)
+				continue;
+			if( candidate == NULL
+				|| (__pcpu_effi(candidate) < __pcpu_effi(prv->cpuArray[i])))
+			{
+				candidate = prv->cpuArray[i];
+			}
+		}
+		if(candidate == NULL){
+			printk("Cannot find a propoer physical core for the virtual core\n");
+			break;
+		}
+		/* assign vcpu to pcpu	*/
+		double res_remain = candidate->prov_freq*(1-((double)candidate->load/(double)ASYM_INTERVAL_TS));
+		if(res_remain >= svc->requ_freq*scale){
+			double percentage = svc->requ_freq*scale/candidate->prov_freq;
+			candidate->workload[svc->code] = (int)(percentage*ASYM_INTERVAL_TS);
+			candidate->load += (int)(percentage*ASYM_INTERVAL_TS);
+			svc->requ_freq = 0;
+			iter_svc = iter_svc->next;
+		}
+		else{
+			candidate->workload[svc->code] = ASYM_INTERVAL_TS-candidate->load;
+			svc->requ_freq -= res_remain/scale;
+			candidate->load = ASYM_INTERVAL_TS;		
+		}
+	};
+
+	/* Phase 2
+	 * Open-shop scheduling
+	 */
+	int	LowerBound;
+	struct asym_decSet decSet;
+	struct list_head exePlan;
+
+	unsigned int* vcoreLoad = xzalloc_array(unsigned int, amountVCPU);
+	unsigned int* matching = xzalloc_array(unsigned int, amountPCPU);
+
+	/* descrete set	*/	
+	decSet.MachTight = (bool*)xzalloc_array(bool, amountPCPU);
+	decSet.JobTight = (bool*)xzalloc_array(bool, amountVCPU);
+	decSet.MachPicked = (bool*)xzalloc_array(bool, amountPCPU);
+	decSet.JobPicked = (bool*)xzalloc_array(bool, amountVCPU);	
+
+	/* Initialization	*/
+	for(int i = 0;i < amountVCPU;i++){
+		vcoreLoad[i] = 0;
+	}		
+	for(i = 0;i < amountPCPU; i++){
+		for(j = 0;j < amountVCPU; j++){			
+			vcoreLoad[j] += prv->cpuArray[i]->workload[j];
+		}
+	}
+
+	while(1){
+		/* find lower bound	*/
+		LowerBound = 0;
+		for(int i = 0;i < amountPCPU;i++){
+			if((prv->master != i)
+				&& (prv->cpuArray[i]->load > LowerBound)){
+				LowerBound = prv->cpuArray[i]->load;
+			}
+		}
+		for(int i = 0;i < amountVCPU;i++){
+			if(vcoreLoad[i] > LowerBound){
+				LowerBound = vcoreLoad[i];
+			}
+		}
+		if(LowerBound == 0.0){
+			// no vcore, we are done in phase 2
+			break;
+		}
+		// init decreSet
+		decSet.delta = LowerBound;
+		memset(decSet.MachTight, 0, sizeof(bool)*amountPCPU);
+		memset(decSet.JobTight, 0, sizeof(bool)*amountVCPU);
+		memset(decSet.MachPicked, 0, sizeof(bool)*amountPCPU);
+		memset(decSet.JobPicked, 0, sizeof(bool)*amountVCPU);
+
+		// find a decreSet
+		for(int i = 0;i < amountPCPU;i++){
+			if(prv->master == i)
+				continue;
+			if(prv->cpuArray[i]->load == LowerBound){
+				decSet.MachTight[i] = true;
+			}
+			else{
+				decSet.MachTight[i] = false;
+				if(decSet.delta > (LowerBound - prv->cpuArray[i]->load)){
+					decSet.delta = LowerBound - prv->cpuArray[i]->load;
+				}
+			}
+		}
+		for(int i = 0;i < amountVCPU;i++){
+			if(vcoreLoad[i] == LowerBound){
+				decSet.JobTight[i] = true;
+			}
+			else{
+				decSet.JobTight[i] = false;
+				if(decSet.delta > (LowerBound - vcoreLoad[i])){
+					decSet.delta = LowerBound - vcoreLoad[i];
+				}
+			}
+		}
+
+		// pick a matching		
+		if(!assginV2P(matching, 0, &decSet)){
+			// something wrong
+			printk("Cannot find a match!\n");
+		}
+
+		// compute delta
+		for(int i = 0;i< amountPCPU; i++){
+			if(prv->master == i)
+				continue;
+			if((matching[i] != -1) && (prv->cpuArray[i]->workload[matching[i]] < decSet.delta)){
+				decSet.delta = prv->cpuArray[i]->workload[matching[i]]s;
+			}
+		}
+		// reduct workload
+		for(int i = 0;i < amountPCPU; i++){
+			if(prv->master == i)
+				continue;
+			if(matching[i] != -1){
+				prv->cpuArray[i]->workload[matching[i]] -= decSet.delta;
+				prv->cpuArray[i]->load -= decSet.delta;
+				vcoreLoad[matching[i]] -= decSet.delta;
+			}			
+		}
+
+		// create an execution slice
+		struct asym_exeSlice *new_slice = xzalloc(struct asym_exeSlice);
+		new_slice->timeslice = decSet.delta;
+		new_slice->mapping = (int*)xzalloc(int, amountPCPU);
+		for(i = 0;i < amountPCPU; i++){
+			new_slice->mapping[i] = matching;
+		}
+		/* add to the list of execution slice
+		 * Assume that there will be no duplication.
+		 */
+		LIST_ADD_TAIL(new_slice, &exePlan);
+	};
+
+	/* free allocated memory in phase 2	*/
+	xfree(decSet.MachTight);
+	xfree(decSet.JobTight);
+	xfree(decSet.MachPicked);
+	xfree(decSet.JobPicked);
+	xfree(matching);
+	xfree(vcoreLoad);
+
+	/* Phase 3
+	 * TODO
+	 */
+
+	__dump_plan();	
+
+	/* free allocated memory	*/
+	for(i = 0; i < CORE_AMOUNT; i++){
+		if((i != prv->master) 
+			&& (prv->cpuArray[CORE_AMOUNT] != NULL)){
+			xfree(workloads);			
+		}
+	}	
 }
 
 static void
@@ -682,7 +966,7 @@ asym_init(struct scheduler *ops)
 	prv->master = 0;
 	int i = 0;
 	for( i = 0 ; i < CORE_AMOUNT; i++){
-		cpuArray[i] = NULL;
+		prv->cpuArray[i] = NULL;
 	}
 		
 	printk("Scheduler initialization Successful.\n");
