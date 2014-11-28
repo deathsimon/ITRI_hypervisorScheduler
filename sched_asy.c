@@ -51,13 +51,12 @@ struct asym_pcpu {
 	/* for scheduling algorithm*/
 	struct asym_pcpuinfo{
 		unsigned int type;	
-		unsigned int provRes;
+		unsigned int provRes;			/* in MHz	*/
 		unsigned int load;
 		unsigned int* workloads;
 		//unsigned int curr_slice;	/* record current time slice in an interval	*/
 	} info;
 };
-
 /*
  * Virtual CPU
  */
@@ -72,12 +71,11 @@ struct asym_vcpu {
 	/* for scheduling algorithm*/
 	struct asym_vcpuinfo{
 		unsigned int vcpuNum;
-		unsigned int requRes;
+		unsigned int requRes;			/* in MHz	*/
 		struct list_head plan;		/* excution period on a pcpu	*/
 		struct list_head act_elem;	/* on the active VCPU list*/
 	} info;	
 };
-
 /*
  * Domain
  */
@@ -86,7 +84,6 @@ struct asym_dom {
     struct list_head sdom_elem;	/* link list on asym_priv	*/
     struct domain *dom;			/* pointer to upper domain	*/
 };
-
 /*
  * System-wide private data
  */
@@ -103,7 +100,6 @@ struct asym_private {
     	
     //cpumask_var_t cpus;
 };
-
 /*
  * Decrementing set in Open Shop Scheduling
  */
@@ -111,10 +107,10 @@ struct asym_decSet{
 	unsigned int numPCPU;
 	unsigned int numVCPU;
 	int delta;
-	bool* MachTight;
-	bool* JobTight;
-	bool* MachPicked;
-	bool* JobPicked;
+	bool_t* MachTight;
+	bool_t* JobTight;
+	bool_t* MachPicked;
+	bool_t* JobPicked;
 	struct asym_pcpu** cpu;
 };
 /*
@@ -136,12 +132,10 @@ struct asym_vcpuPlan{
 	unsigned int end_slice;
 	struct list_head plan_elem;	/* on the plan list*/
 };
-
 static void asym_tick(void *_cpu);
-static void asym_gen_plan(void* dummy);
-static bool assignV2P(int* matching, int level, struct asym_decSet *decSet);
+static void asym_gen_plan(void *dummy);
+static bool_t assignV2P(int* matching, int level, struct asym_decSet *decSet);
 static inline struct asym_vcpuPlan* __plan_elem(struct asym_vcpu* svc);
-
 /*
  * Inline functions from credit-base scheduler
  */
@@ -277,6 +271,7 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 	struct asym_pcpu *spc;
     struct asym_private *prv = ASYM_PRIV(ops);
     unsigned long flags;
+	unsigned periods = ASYM_INTERVAL_TS*ASYM_TIMESLICE_MS;
 
     /* Allocate per-PCPU info */
     spc = xzalloc(struct asym_pcpu);
@@ -291,7 +286,7 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 	if(cpu == prv->master){
 		init_timer(&prv->timer_gen_plan, asym_gen_plan, prv, cpu);
 		set_timer(&prv->timer_gen_plan,
-			NOW() + MILLISECS(ASYM_INTERVAL_TS*ASYM_TIMESLICE_MS));		
+			NOW() + MILLISECS(periods));
 	}
 	init_timer(&spc->ticker, asym_tick, (void *)(unsigned long)cpu, cpu);
     set_timer(&spc->ticker, NOW() + MICROSECS(ASYM_TIMESLICE_MS) );		
@@ -577,16 +572,17 @@ asym_dom_destroy(const struct scheduler *ops, struct domain *dom)
 }
 
 /* The physica core efficieness	*/
-static inline double
+static inline unsigned int
 __pcpu_effi(struct asym_pcpu *spc){
 	/* For now, justify accroding to core type	*/	
-	return (double)spc->info.type;
+	return spc->info.type;
 }
 static inline void
-__dump_plan(){
+__dump_plan(void){
 	/* TODO */
 	printk("Dump plan\n");
 }
+
 /* return the virtual core in the list with the specific vcpu number	*/
 static inline struct asym_vcpu *
 __fetch_vcpu_num(int num, struct list_head *active_vcpu){	
@@ -637,9 +633,9 @@ __interaction(struct asym_exeSlice *slice, struct list_head *exeSlice, int amoun
 	return times;
 }
 
-static bool
-assignV2P(int* matching, int level, struct asym_decSet *decSet){
-	bool findAns = false;
+static bool_t
+assignV2P(int *matching, int level, struct asym_decSet *decSet){
+	bool_t findAns = false;
 
 	if(level == decSet->numPCPU){
 		findAns = true;
@@ -687,33 +683,213 @@ assignV2P(int* matching, int level, struct asym_decSet *decSet){
 	return findAns;
 }
 
+/* Greedy Assignment
+ * Assign vcpu to the most "efficient" pcpu with load less than 100%
+ */
 static void
-asym_gen_plan(void* dummy){	
+__phase_1(struct asym_private *prv, struct list_head *active_vcpu){
+	struct asym_vcpu *svc;
+	struct asym_pcpu *cand_cpu;
+	struct list_head *iter_svc;
+	uint32_t percentage;
+	
+	iter_svc = active_vcpu->next;
+	while( iter_svc != active_vcpu )
+	{
+		svc = list_entry(iter_svc, struct asym_vcpu, info.act_elem);
+		cand_cpu = NULL;
+		for(int i = 0; i < CORE_AMOUNT; i++){
+			/* if current pcpu is for dom0 or is fully loaded, pass	*/
+			if(i == prv->master)
+				continue;
+			if(prv->cpuArray[i]->info.load == ASYM_INTERVAL_TS)
+				continue;
+			if( cand_cpu == NULL
+				|| (__pcpu_effi(cand_cpu) < __pcpu_effi(prv->cpuArray[i])))
+			{
+				cand_cpu = prv->cpuArray[i];
+			}
+		}
+		if(cand_cpu == NULL){
+			printk("Cannot find a propoer physical core for the virtual core\n");
+			break;
+		}
+		/* assign vcpu to pcpu	*/				
+		percentage = 0U;
+		if(cand_cpu->info.provRes >= svc->info.requRes){
+			percentage = svc->info.requRes/cand_cpu->info.provRes;
+			cand_cpu->info.workloads[svc->info.vcpuNum] = (unsigned int)(percentage*ASYM_INTERVAL_TS);
+			cand_cpu->info.load += (unsigned int)(percentage*ASYM_INTERVAL_TS);
+			svc->info.requRes = 0;
+			iter_svc = iter_svc->next;
+		}
+		else{
+			cand_cpu->info.workloads[svc->info.vcpuNum] = ASYM_INTERVAL_TS-cand_cpu->info.load;
+			svc->info.requRes -= cand_cpu->info.provRes;
+			cand_cpu->info.load = ASYM_INTERVAL_TS;
+		}
+	};
+}
+/* Phase 2
+ * Open-shop scheduling
+ */
+static void
+__phase_2(struct asym_private *prv, struct list_head* exeSlice, unsigned int amountPCPU, unsigned int amountVCPU){
+	
+	int	LowerBound;
+	int *assignment;
+	unsigned int *vcoreLoad;
+	
+	struct asym_decSet decSet;
+	struct asym_exeSlice *new_slice;
+	
+	vcoreLoad = xzalloc_array(unsigned int, amountVCPU);
+	assignment = xzalloc_array(int, amountPCPU);
+
+	/* descrete set	*/
+	decSet.MachTight = (bool_t*)xzalloc_array(bool_t, amountPCPU);
+	decSet.JobTight = (bool_t*)xzalloc_array(bool_t, amountVCPU);
+	decSet.MachPicked = (bool_t*)xzalloc_array(bool_t, amountPCPU);
+	decSet.JobPicked = (bool_t*)xzalloc_array(bool_t, amountVCPU);	
+
+	decSet.numPCPU = amountPCPU;
+	decSet.numVCPU = amountVCPU;
+	decSet.cpu = &prv->cpuArray[0];
+
+	/* Initialization	*/
+	for(int i = 0;i < amountVCPU;i++){
+		vcoreLoad[i] = 0;
+	}		
+	for(int i = 0;i < amountPCPU; i++){
+		for(int j = 0;j < amountVCPU; j++){			
+			vcoreLoad[j] += prv->cpuArray[i]->info.workloads[j];
+		}
+	}
+
+	while(1){
+		/* find lower bound	*/
+		LowerBound = 0;
+		for(int i = 0;i < amountPCPU;i++){
+			if((prv->master != i)
+				&& (prv->cpuArray[i]->info.load > LowerBound)){
+				LowerBound = prv->cpuArray[i]->info.load;
+			}
+		}
+		for(int i = 0;i < amountVCPU;i++){
+			if(vcoreLoad[i] > LowerBound){
+				LowerBound = vcoreLoad[i];
+			}
+		}
+		if(LowerBound == 0){
+			// no vcore, we are done in phase 2
+			break;
+		}
+		// init decreSet
+		decSet.delta = LowerBound;
+		for(int i = 0 ; i < amountPCPU; i++){
+			decSet.MachTight[i] = false;
+			decSet.MachPicked[i] = false;
+		}
+		for(int i = 0 ; i < amountVCPU; i++){
+			decSet.JobTight[i] = false;
+			decSet.JobPicked[i] = false;
+		}
+		
+		// find a decreSet
+		for(int i = 0;i < amountPCPU;i++){
+			if(prv->master == i)
+				continue;
+			if(prv->cpuArray[i]->info.load == LowerBound){
+				decSet.MachTight[i] = true;
+			}
+			else{
+				decSet.MachTight[i] = false;
+				if(decSet.delta > (LowerBound - prv->cpuArray[i]->info.load)){
+					decSet.delta = LowerBound - prv->cpuArray[i]->info.load;
+				}
+			}
+		}
+		for(int i = 0;i < amountVCPU;i++){
+			if(vcoreLoad[i] == LowerBound){
+				decSet.JobTight[i] = true;
+			}
+			else{
+				decSet.JobTight[i] = false;
+				if(decSet.delta > (LowerBound - vcoreLoad[i])){
+					decSet.delta = LowerBound - vcoreLoad[i];
+				}
+			}
+		}		
+
+		// pick an ansignment
+		if(!assignV2P(assignment, 0, &decSet)){
+			// something wrong
+			printk("Cannot find an ansignment on virtual core to physical core!\n");
+		}
+		// compute delta
+		for(int i = 0;i< amountPCPU; i++){
+			if(prv->master == i)
+				continue;
+			if((assignment[i] != -1) && (prv->cpuArray[i]->info.workloads[assignment[i]] < decSet.delta)){
+				decSet.delta = prv->cpuArray[i]->info.workloads[assignment[i]];
+			}
+		}
+		// reduct workload
+		for(int i = 0;i < amountPCPU; i++){
+			if(prv->master == i)
+				continue;
+			if(assignment[i] != -1){
+				prv->cpuArray[i]->info.workloads[assignment[i]] -= decSet.delta;
+				prv->cpuArray[i]->info.load -= decSet.delta;
+				vcoreLoad[assignment[i]] -= decSet.delta;
+			}			
+		}
+
+		// create an execution slice
+		new_slice = xzalloc(struct asym_exeSlice);
+		new_slice->timeslice = decSet.delta;
+		new_slice->mapping = xzalloc_array(int, amountPCPU);
+		for(int i = 0;i < amountPCPU; i++){
+			new_slice->mapping[i] = assignment[i];
+		}
+		/* add to the list of execution slice
+		 * Assume that there will be no duplication.
+		 */
+		list_add_tail(&new_slice->slice_elem, exeSlice);
+	};
+	/* free allocated memory in phase 2	*/
+	xfree(decSet.MachTight);
+	xfree(decSet.JobTight);
+	xfree(decSet.MachPicked);
+	xfree(decSet.JobPicked);
+	xfree(assignment);
+	xfree(vcoreLoad);
+}
+
+static void
+asym_gen_plan(void *dummy){
 	/* declarations: general */
+
 	struct asym_private *prv = dummy;
 	struct asym_dom *sdom;
 	struct asym_vcpu *svc;
-	struct asym_pcpu *spc, *cand_cpu;
+	struct asym_pcpu *spc;
+	unsigned long flags;
 
 	struct list_head active_vcpu;
 	struct list_head *iter_sdom, *iter_svc;
-
-	/* declarations: phase 1 */
-	unsigned int amountPCPU;
+	
+	unsigned int amountPCPU = 0;
 	unsigned int amountVCPU = 0, dom0VCPU = 0;	
-	double prov, requ;
-	double total_prov = 0.0, total_requ = 0.0;
-	double scale;
-	double res_remain;
 
-	/* declarations: phase 2 */
-	int	LowerBound;
-	struct asym_decSet decSet;
+	/* declarations: phase 1 */	
+	unsigned int prov, requ;
+	unsigned int total_prov = 0, total_requ = 0;
+	uint16_t scale = 0;	
+
+	/* declarations: phase 2 */	
 	struct list_head exeSlice;
-	unsigned int *vcoreLoad;
-	int *assignment;
-	struct asym_exeSlice *new_slice;
-
+	
 	/* declarations: phase 3 */
 	unsigned int numSwitching = 0;
 	unsigned int numIncrease, minIncrease = 0;	
@@ -726,6 +902,9 @@ asym_gen_plan(void* dummy){
 	/* declarations: final */
 	struct asym_vcpuPlan *newPlanElem;
 	unsigned int now = 0;
+
+
+	spin_lock_irqsave(&prv->lock, flags);
 
 	INIT_LIST_HEAD(&active_vcpu);
 
@@ -763,7 +942,7 @@ asym_gen_plan(void* dummy){
 	 */	
 	for(int i = 0; i < CORE_AMOUNT; i++){
 		if((i != prv->master) 
-			&& (prv->cpuArray[CORE_AMOUNT] != NULL)){
+			&& (prv->cpuArray[i] != NULL)){
 			spc = prv->cpuArray[i];
 			spc->info.load = 0;
 			/* accumulate total provision	*/
@@ -777,174 +956,24 @@ asym_gen_plan(void* dummy){
 
 	/* Phase 1
 	 * compute scale factor
-	 * scale = 1: the current physical core setting can process all the virtual core requirements
-	 * scale < 1: scale down the virtual core requirements
+	 * scale: number of right shift on resource requirement
 	 */
-	(total_prov >= total_requ)?(scale = 1):(scale = total_prov/total_requ);
-
-	/* Greedy Assignment
-	 * Assign vcpu to the most "efficient" pcpu with load less than 100%
-	 */
-	iter_svc = active_vcpu.next;
-	while( iter_svc != &active_vcpu )
-	{
-		svc = list_entry(iter_svc, struct asym_vcpu, info.act_elem);
-		cand_cpu = NULL;
-		for(int i = 0; i < CORE_AMOUNT; i++){
-			/* if current pcpu is for dom0 or is fully loaded, pass	*/
-			if(i == prv->master)
-				continue;
-			if(prv->cpuArray[i]->info.load == ASYM_INTERVAL_TS)
-				continue;			
-			if( cand_cpu == NULL
-				|| (__pcpu_effi(cand_cpu) < __pcpu_effi(prv->cpuArray[i])))
-			{
-				cand_cpu = prv->cpuArray[i];
-			}
-		}
-		if(cand_cpu == NULL){
-			printk("Cannot find a propoer physical core for the virtual core\n");
-			break;
-		}
-		/* assign vcpu to pcpu	*/
-		res_remain = cand_cpu->info.provRes*(1-((double)cand_cpu->info.load/(double)ASYM_INTERVAL_TS));
-		if(res_remain >= svc->info.requRes*scale){
-			double percentage = svc->info.requRes*scale/cand_cpu->info.provRes;
-			cand_cpu->info.workloads[svc->info.vcpuNum] = (unsigned int)(percentage*ASYM_INTERVAL_TS);
-			cand_cpu->info.load += (unsigned int)(percentage*ASYM_INTERVAL_TS);
-			svc->info.requRes = 0;
-			iter_svc = iter_svc->next;
-		}
-		else{
-			cand_cpu->info.workloads[svc->info.vcpuNum] = ASYM_INTERVAL_TS-cand_cpu->info.load;
-			svc->info.requRes -= (unsigned int)res_remain/scale;
-			cand_cpu->info.load = ASYM_INTERVAL_TS;		
-		}
+	scale = 0;
+	while(total_prov < total_requ){
+		total_requ = total_requ>>1;
+		scale++;
 	};
+	list_for_each_entry(svc, &active_vcpu, info.act_elem){
+		svc->info.requRes = svc->info.requRes>>scale;
+	}
+
+	__phase_1(prv, &active_vcpu);
 
 	/* Phase 2
 	 * Open-shop scheduling
 	 */
-	vcoreLoad = xzalloc_array(unsigned int, amountVCPU);
-	assignment = xzalloc_array(int, amountPCPU);
-
-	/* descrete set	*/
-	decSet.MachTight = (bool*)xzalloc_array(bool, amountPCPU);
-	decSet.JobTight = (bool*)xzalloc_array(bool, amountVCPU);
-	decSet.MachPicked = (bool*)xzalloc_array(bool, amountPCPU);
-	decSet.JobPicked = (bool*)xzalloc_array(bool, amountVCPU);	
-
-	decSet.numPCPU = amountPCPU;
-	decSet.numVCPU = amountVCPU;
-	decSet.cpu = &prv->cpuArray[0];
-
-	/* Initialization	*/
-	for(int i = 0;i < amountVCPU;i++){
-		vcoreLoad[i] = 0;
-	}		
-	for(int i = 0;i < amountPCPU; i++){
-		for(int j = 0;j < amountVCPU; j++){			
-			vcoreLoad[j] += prv->cpuArray[i]->info.workloads[j];
-		}
-	}
-
-	while(1){
-		/* find lower bound	*/
-		LowerBound = 0;
-		for(int i = 0;i < amountPCPU;i++){
-			if((prv->master != i)
-				&& (prv->cpuArray[i]->info.load > LowerBound)){
-				LowerBound = prv->cpuArray[i]->info.load;
-			}
-		}
-		for(int i = 0;i < amountVCPU;i++){
-			if(vcoreLoad[i] > LowerBound){
-				LowerBound = vcoreLoad[i];
-			}
-		}
-		if(LowerBound == 0.0){
-			// no vcore, we are done in phase 2
-			break;
-		}
-		// init decreSet
-		decSet.delta = LowerBound;
-		memset(decSet.MachTight, 0, sizeof(bool)*amountPCPU);
-		memset(decSet.JobTight, 0, sizeof(bool)*amountVCPU);
-		memset(decSet.MachPicked, 0, sizeof(bool)*amountPCPU);
-		memset(decSet.JobPicked, 0, sizeof(bool)*amountVCPU);
-
-		// find a decreSet
-		for(int i = 0;i < amountPCPU;i++){
-			if(prv->master == i)
-				continue;
-			if(prv->cpuArray[i]->info.load == LowerBound){
-				decSet.MachTight[i] = true;
-			}
-			else{
-				decSet.MachTight[i] = false;
-				if(decSet.delta > (LowerBound - prv->cpuArray[i]->info.load)){
-					decSet.delta = LowerBound - prv->cpuArray[i]->info.load;
-				}
-			}
-		}
-		for(int i = 0;i < amountVCPU;i++){
-			if(vcoreLoad[i] == LowerBound){
-				decSet.JobTight[i] = true;
-			}
-			else{
-				decSet.JobTight[i] = false;
-				if(decSet.delta > (LowerBound - vcoreLoad[i])){
-					decSet.delta = LowerBound - vcoreLoad[i];
-				}
-			}
-		}
-
-		// pick an ansignment
-		if(!assignV2P(assignment, 0, &decSet)){
-			// something wrong
-			printk("Cannot find an ansignment on virtual core to physical core!\n");
-		}
-
-		// compute delta
-		for(int i = 0;i< amountPCPU; i++){
-			if(prv->master == i)
-				continue;
-			if((assignment[i] != -1) && (prv->cpuArray[i]->info.workloads[assignment[i]] < decSet.delta)){
-				decSet.delta = prv->cpuArray[i]->info.workloads[assignment[i]];
-			}
-		}
-		// reduct workload
-		for(int i = 0;i < amountPCPU; i++){
-			if(prv->master == i)
-				continue;
-			if(assignment[i] != -1){
-				prv->cpuArray[i]->info.workloads[assignment[i]] -= decSet.delta;
-				prv->cpuArray[i]->info.load -= decSet.delta;
-				vcoreLoad[assignment[i]] -= decSet.delta;
-			}			
-		}
-
-		// create an execution slice
-		new_slice = xzalloc(struct asym_exeSlice);
-		new_slice->timeslice = decSet.delta;
-		new_slice->mapping = xzalloc_array(int, amountPCPU);
-		for(int i = 0;i < amountPCPU; i++){
-			new_slice->mapping[i] = assignment[i];
-		}
-		/* add to the list of execution slice
-		 * Assume that there will be no duplication.
-		 */
-		list_add_tail(&new_slice->slice_elem, &exeSlice);
-	};
-
-	/* free allocated memory in phase 2	*/
-	xfree(decSet.MachTight);
-	xfree(decSet.JobTight);
-	xfree(decSet.MachPicked);
-	xfree(decSet.JobPicked);
-	xfree(assignment);
-	xfree(vcoreLoad);
-
+	__phase_2(prv, &exeSlice, amountPCPU, amountVCPU);
+	
 	/* Phase 3
 	 * 
 	 */
@@ -1024,10 +1053,14 @@ asym_gen_plan(void* dummy){
 	/* free allocated memory	*/
 	for(int i = 0; i < CORE_AMOUNT; i++){
 		if((i != prv->master) 
-			&& (prv->cpuArray[CORE_AMOUNT] != NULL)){
-			xfree(spc->info.workloads);			
+			&& (prv->cpuArray[i] != NULL)){
+			spc = prv->cpuArray[i];
+			xfree(spc->info.workloads);
 		}
 	}
+
+	spin_unlock_irqrestore(&prv->lock, flags);
+
 }
 /* Increase current slice number of each physical core	*/
 static void
