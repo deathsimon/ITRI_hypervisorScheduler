@@ -162,6 +162,7 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
     struct list_head *iter;
 	unsigned int vcpu_start;
 	unsigned int curr_start;
+	struct asym_vcpuPlan* planElem = NULL;
 
     BUG_ON( __vcpu_on_runq(svc) );
     BUG_ON( cpu != svc->vcpu->processor );
@@ -171,16 +172,25 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
 		svc->vcpu->vcpu_id, cpu);
 #endif
 	svc->on_cpu = cpu;
-	vcpu_start = __plan_elem(svc)->start_slice;
-	/* list_for_each(pos, head)  */
-    list_for_each( iter, runq )
-    {
-        struct asym_vcpu * iter_svc = __runq_elem(iter);
-		curr_start = __plan_elem(iter_svc)->start_slice;
-		/* insert according to the start_time of the vcpu	*/
-        if ( vcpu_start < curr_start )
-            break;
-    }	
+	planElem = __plan_elem(svc);
+	if(planElem != NULL){
+		vcpu_start = planElem->start_slice;
+		/* list_for_each(pos, head)  */
+		list_for_each( iter, runq )
+		{
+			struct asym_vcpu * iter_svc = __runq_elem(iter);
+			planElem = __plan_elem(iter_svc);
+			if(planElem != NULL){
+				curr_start = planElem->start_slice;
+				/* insert according to the start_time of the vcpu	*/
+				if ( vcpu_start < curr_start )
+					break;
+			}
+		}	
+	}
+	else{
+		iter = RUNQ(cpu);
+	}
 	list_add_tail(&svc->runq_elem, iter);
 }
 
@@ -1178,7 +1188,7 @@ asym_schedule(
     //struct asym_private *prv = ASYM_PRIV(ops);
     struct asym_vcpu *snext;
     struct task_slice ret;
-	struct asym_vcpuPlan *plan = __plan_elem(scurr);
+	struct asym_vcpuPlan *plan;
 	
 #ifdef	ASYM_DEBUG
 	printk("[SCHED_ASYM] asym_scheduler() is called by cpu %i.\n", cpu);
@@ -1191,7 +1201,7 @@ asym_schedule(
 	 * Else, migrate the vcpu to the next pcpu according to the scheduling plan,
 	 * and fetch the next vcpu from run queue.
 	 */
-	
+	plan = __plan_elem(scurr);
 	/* Tasklet work (which runs in idle VCPU context) overrides all else. */
     if ( tasklet_work_scheduled )
     {       
@@ -1227,7 +1237,9 @@ asym_schedule(
 		/* If its start_time is less or equal to curr_slice, start the execution
 		 * else, idle for a time slice
 		 */
-		if(__plan_elem(snext)->start_slice <= get_cpu_var(curr_slice)){
+		plan = __plan_elem(snext);
+		if(plan != NULL
+			&& plan->start_slice <= get_cpu_var(curr_slice)){
 			ret.task = snext->vcpu;
 		}
 		else{			
