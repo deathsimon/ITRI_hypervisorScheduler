@@ -26,9 +26,9 @@
 #define	TYPE_PERFORMANCE			0
 #define	TYPE_EFFICIENCY				1
 
-#define	FREQ_PERFORMANCE			1200000	/* KHz	*/
-#define	FREQ_EFFICIENCY				600000
-#define FREQ_MINIMUM				FREQ_EFFICIENCY/2
+#define	FREQ_PERFORMANCE			57600	/* KHz	*/
+#define	FREQ_EFFICIENCY				19200
+#define FREQ_MINIMUM				FREQ_EFFICIENCY/4
 
 #define	DOM0_ID					0
 
@@ -43,6 +43,8 @@
 #define ASYM_FLAG_VCPU_EARLY	0x4 /* execute the VPCU earlier since the current one is not runnable */
 
 //#define	ASYM_DEBUG
+
+//#define PASSIVE_MIGRATION
 
 #ifdef	ASYM_DEBUG
 #define DEBUGMSG(msg, arg...)	printk(msg, ##arg)
@@ -135,8 +137,6 @@ struct asym_private {
 	unsigned int master_timer;
 	unsigned int master;
 	struct asym_pcpu* cpuArray[CORE_AMOUNT];
-    	
-	//cpumask_var_t cpus;
 };
 /*
  * Decrementing set in Open Shop Scheduling
@@ -181,15 +181,13 @@ static inline struct asym_vcpuPlan* __plan_elem(struct asym_vcpu* svc);
  */
 static inline int
 __vcpu_on_runq(struct asym_vcpu *svc)
-{
-	/* list_empty(const struct list_head *head) */
+{	
 	return !list_empty(&svc->runq_elem);
 }
 
 static inline struct asym_vcpu *
 __runq_elem(struct list_head *elem)
-{
-	/* list_entry(ptr,type,member) */
+{	
 	return list_entry(elem, struct asym_vcpu, runq_elem);
 }
 
@@ -202,84 +200,76 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
 	struct asym_vcpuPlan* planElem = NULL;
 
 	BUG_ON( __vcpu_on_runq(svc) );
-
-	/* BUG_ON( cpu != svc->vcpu->processor ); */	
+	//BUG_ON( cpu != svc->vcpu->processor );
 
 	/* DEBUGMSG("[SCHED_ASYM] insert vcore %i into the run queue on core %i \n",	
 		svc->vcpu->vcpu_id, cpu); */
-
-	svc->vcpu->processor = cpu;
+	
 	planElem = __plan_elem(svc);
-	if(planElem != NULL){
-		if(cpu == 4){
-			DEBUGMSG("[SCHED_ASYM] vcpu(%i,%i) has planElem (%i, %i).\n",
+	if(planElem != NULL){		
+		/*
+		DEBUGMSG("[SCHED_ASYM] vcpu(%i,%i) has planElem (%i, %i).\n",
 				svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id, planElem->start_slice, planElem->end_slice);
-		}
+		*/
 		vcpu_start = planElem->start_slice;
 		/* list_for_each(pos, head)  */
 		list_for_each( iter, runq )
 		{
-			struct asym_vcpu * iter_svc = __runq_elem(iter);
-			planElem = __plan_elem(iter_svc);
+			//struct asym_vcpu * iter_svc = __runq_elem(iter);
+			//planElem = __plan_elem(iter_svc);
+			planElem = __plan_elem(__runq_elem(iter));
 			if(planElem != NULL){
 				curr_start = planElem->start_slice;
-				
-				if(cpu == 4){
-					DEBUGMSG("\tvcpu has plan (%i, %i).\n", planElem->start_slice, planElem->end_slice);
-				}
-
+				//DEBUGMSG("\tvcpu has plan (%i, %i).\n", planElem->start_slice, planElem->end_slice);
 				/* insert according to the start_time of the vcpu	*/
 				if ( vcpu_start < curr_start ){
-					printk("[SCHED_ASYM] This should never happens.\n");
 					break;
 				}
-			}
-			else{
-				if(cpu == 4){
-					DEBUGMSG("\tvcpu has no plan.\n");
-				}
-			}
+			}			
 		}	
 	}
 	else{
-		if(cpu == 4){
-			DEBUGMSG("[SCHED_ASYM] vcpu(%i,%i) has no planElem, add to tail.\n", svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id);
-		}
+		// DEBUGMSG("[SCHED_ASYM] vcpu(%i,%i) has no planElem, add to tail.\n", svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id);		
 		iter = RUNQ(cpu);
 	}
 	list_add_tail(&svc->runq_elem, iter);
+
 	BUG_ON( !__vcpu_on_runq(svc) );
 }
 
 static inline void
 __runq_remove(struct asym_vcpu *svc)
 {
-    BUG_ON( !__vcpu_on_runq(svc) );
-
+	BUG_ON( !__vcpu_on_runq(svc) );
 	/*
 	DEBUGMSG("[SCHED_ASYM] remove vcore %i from the run queue\n",
 		svc->vcpu->vcpu_id);
 	*/
-	list_del_init(&svc->runq_elem);
-	//svc->on_cpu = UINT_MAX;
+	list_del_init(&svc->runq_elem);	
 }
 static inline void
-__runq_migrate(unsigned int cpu, struct asym_vcpu *svc)
+__runq_tickle(unsigned int cpu, struct asym_vcpu *new)
 {
-	struct asym_vcpuPlan* elem;
-	unsigned int target;
-
-	__runq_remove(svc);
-	/*
-	DEBUGMSG("[SCHED_ASYM] migrate vcore (%i, %i) to ", 
-		svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id);	
-	*/
-	elem = __plan_elem(svc);
-	(elem != NULL)?(target = elem->pcpu):(target = cpu);		
-
-	//DEBUGMSG("core %i\n", target);
+	/* 
+	 * Raise softirq to tell the cpu to re-schedule.
+	 */	
+	cpu_raise_softirq(cpu, SCHEDULE_SOFTIRQ);   	
+}
+static inline void
+__runq_migrate(unsigned int target, struct asym_vcpu *svc)
+{
+	if ( __vcpu_on_runq(svc) )
+		__runq_remove(svc);
 	
+	/*
+	DEBUGMSG("[SCHED_ASYM] migrate vcore (%i, %i) from %i to %i.\n", 
+		svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id, sorurce, target );	
+	*/
+#ifndef PASSIVE_MIGRATION
+	svc->vcpu->processor = target;
+#endif
 	__runq_insert(target, svc);
+	__runq_tickle(target, svc);
 }
 static inline void
 __runq_check(unsigned int cpu)
@@ -287,21 +277,23 @@ __runq_check(unsigned int cpu)
 	const struct list_head * const runq = RUNQ(cpu);
 	struct list_head *iter, *iter_next;
 	struct asym_vcpu * iter_svc;
+	struct asym_vcpuPlan *planElem;
 
 	list_for_each_safe( iter, iter_next, runq )
 	{
 		iter_svc = __runq_elem(iter);
-		if(iter_svc->vcpu->processor != cpu)
-			__runq_migrate(cpu, iter_svc);		
+		planElem = __plan_elem(iter_svc);
+		if(planElem != NULL
+			&& planElem->pcpu != cpu){
+#ifdef PASSIVE_MIGRATION
+			DEBUGMSG("[SCHED_ASYM] set migrating bit: runq_check.\n");
+			set_bit(_VPF_migrating, &iter_svc->vcpu->pause_flags);
+			__runq_tickle(cpu, iter_svc);
+#else
+			__runq_migrate(planElem->pcpu, iter_svc);
+#endif
+		}
 	}
-}
-static inline void
-__runq_tickle(unsigned int cpu, struct asym_vcpu *new)
-{
-	/* After inserting a vcpu to the runqueue of a pcpu, 
-	 * raise softirq to tell the cpu to re-schedule.
-	 */	
-	cpu_raise_softirq(cpu, SCHEDULE_SOFTIRQ);   	
 }
 /* get the first plan element of a virtual core
  * return NULL if there is no plan element
@@ -325,21 +317,26 @@ static inline struct asym_vcpuPlan*
 __pop_elem(struct asym_vcpu* svc)
 {
 	struct asym_vcpuPlan* vplan = NULL;
-	struct asym_vcpuPlan* del_elem;
+	struct asym_vcpuPlan* del_elem = NULL;
 
 	BUG_ON(list_empty(&svc->info.plan));
 	
 	while(test_and_set_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags));
 
-	del_elem = list_entry(svc->info.plan.next, struct asym_vcpuPlan, plan_elem);		
-	list_del_init(svc->info.plan.next);
+	if(!list_empty(&svc->info.plan)){
+		del_elem = list_entry(svc->info.plan.next, struct asym_vcpuPlan, plan_elem);		
+		list_del_init(svc->info.plan.next);
+	}
 	
 	if(!list_empty(&svc->info.plan)){
 		vplan = list_entry(svc->info.plan.next, struct asym_vcpuPlan, plan_elem);
 	}
+
 	clear_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags);
 
-	xfree(del_elem);
+	if(del_elem != NULL){
+		xfree(del_elem);
+	}
 
 	return vplan;
 }
@@ -347,16 +344,20 @@ static inline void
 __clean_elem(struct asym_vcpu* svc)
 {
 	struct asym_vcpuPlan* del_elem;
+	struct list_head * const plan_head = &svc->info.plan;
+	struct list_head *iter, *iter_next;
 
 	// DEBUGMSG("[SCHED_ASYM] Clean elements on vcpu %i.\n", svc->vcpu->vcpu_id);
 
 	while(test_and_set_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags));
 
-	while(!list_empty(&svc->info.plan)){
-		del_elem = list_entry(svc->info.plan.next, struct asym_vcpuPlan, plan_elem);		
-		list_del_init(svc->info.plan.next);
-		xfree(del_elem);
-	};	
+	list_for_each_safe(iter, iter_next, plan_head){
+		del_elem = list_entry(iter, struct asym_vcpuPlan, plan_elem);
+		list_del_init(iter);
+		if(del_elem)
+			xfree(del_elem);
+	}
+	
 	//INIT_LIST_HEAD(&svc->info.plan);	
 
 	clear_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags);
@@ -383,10 +384,14 @@ __fetch_vcore_frequ(struct vcpu *vcpu){
 	
 	if(freq == 0){		
 		freq = FREQ_MINIMUM;
-	}	
+	}
 	/*
-	DEBUGMSG("__fetch_vcore_freq() : vcpu (%i, %i) , freq = %i.\n",
+	else{		
+		if(vcpu->domain->domain_id != DOM0_ID){
+		DEBUGMSG("__fetch_vcore_freq() : vcpu (%i, %i) , freq = %i.\n",
 			vcpu->domain->domain_id, vcpu->vcpu_id, freq);
+		}		
+	}
 	*/
 	return freq;
 }
@@ -418,8 +423,8 @@ asym_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
 	
 	/* remove the pcpu from the pcpu array */
 	prv->cpuArray[cpu] = NULL;
-	/* clean runq */
 	
+	/* clean runq */
 	while(!list_empty(&spc->runq)){
 		svc = list_entry(spc->runq.next, struct asym_vcpu, runq_elem);
 		list_del_init(&svc->runq_elem);
@@ -503,10 +508,10 @@ asym_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
 	planElem = __plan_elem(ASYM_VCPU(vc));
 
 	/* if no plan, put to the runqueue of pcpu first	*/
-	(planElem != NULL)?(cpu = planElem->pcpu):(cpu = 2);
+	(planElem != NULL)?(cpu = planElem->pcpu):(cpu = 2);//(vc->domain->domain_id + 1));
 	//(planElem != NULL)?(cpu = planElem->pcpu):(cpu = vc->processor);
 
-	//DEBUGMSG("[SCHED_ASYM] cpu_pick() choose pcpu %i for vcpu %i of domain %i\n", cpu, vc->vcpu_id, vc->domain->domain_id);
+	DEBUGMSG("[SCHED_ASYM] cpu_pick() choose pcpu %i for vcpu %i of domain %i\n", cpu, vc->vcpu_id, vc->domain->domain_id);
 
 	return cpu;
 }
@@ -548,26 +553,23 @@ static void
 asym_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
 {
     struct asym_vcpu *svc = vc->sched_priv;
+
+	//DEBUGMSG("[SCHED_ASYM] insert vcpu (%i, %i).\n", vc->domain->domain_id, vc->vcpu_id);
 	
 	if ( is_idle_vcpu(vc) )
         return;
 		
 	if ( !__vcpu_on_runq(svc) && vcpu_runnable(vc) && !vc->is_running )		
-		__runq_insert(vc->processor, svc);	
-
-	/* if this vcpu belong does not belong to any dom, somethings wrong */	
-	/*
-	if(!list_empty(&svc->sdom_elem))
-		list_add_tail(&svc->sdom_elem, &svc->sdom->vcpu);		
-	
-	BUG_ON(list_empty(&svc->sdom_elem));
-	*/
+		__runq_insert(vc->processor, svc);
 }
 
 static void
 asym_free_vdata(const struct scheduler *ops, void *priv)
 {
 	struct asym_vcpu *svc = priv;
+
+	if( svc == NULL)
+		return;
 
     BUG_ON( !list_empty(&svc->runq_elem) );
 
@@ -609,7 +611,7 @@ asym_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
 
 	BUG_ON( is_idle_vcpu(vc) );
 
-	DEBUGMSG("[SCHED_ASYM] vcpu_sleep() is called by vcpu %i of domain %i.\n", vc->vcpu_id, vc->domain->domain_id);
+	//DEBUGMSG("[SCHED_ASYM] vcpu_sleep() is called by vcpu %i of domain %i.\n", vc->vcpu_id, vc->domain->domain_id);
 
 	if ( curr_on_cpu(vc->processor) == vc ){
 		/* if running on pcpu	*/
@@ -617,12 +619,8 @@ asym_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
 		cpu_raise_softirq(vc->processor, SCHEDULE_SOFTIRQ);	
 	}
 	else if ( __vcpu_on_runq(svc) ){
-		/* only on runqueue	*/
-		DEBUGMSG("[SCHED_ASYM] on runq.\n");
+		/* only on runqueue	*/		
 		__runq_remove(svc);
-	}
-	else{
-		DEBUGMSG("[SCHED_ASYM] hun?\n");
 	}
 }
 
@@ -659,7 +657,7 @@ asym_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
 
 	/* Put the VCPU into the runq, and tirgger the re-scheduling on the cpu	*/	
 	__runq_insert(cpu, svc);
-	__runq_tickle(cpu, svc);	
+	__runq_tickle(cpu, svc);
 }
 
 static void
@@ -800,7 +798,7 @@ __dump_plan(struct asym_private *prv){
 
 	list_for_each( iter_sdom, &prv->sdom ){	
 		sdom = list_entry(iter_sdom, struct asym_dom, sdom_elem);
-		
+		if(sdom->dom->domain_id != DOM0_ID){
 		list_for_each( iter_svc, &sdom->vcpu )
 		{			
 			svc = list_entry(iter_svc, struct asym_vcpu, sdom_elem);
@@ -814,6 +812,7 @@ __dump_plan(struct asym_private *prv){
 			DEBUGMSG("\n");
 
 			clear_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags);
+		}
 		}
 	}
 }
@@ -852,6 +851,9 @@ __interaction(struct asym_exeSlice *slice, struct list_head *exeSlice, int amoun
 	unsigned int vCore = 0;
 	struct asym_exeSlice* currSlice;
 	int* tempMap = xzalloc_array(int, amountVCPU);
+
+	if( tempMap == NULL)
+		return 0;
 
 	for(int i=0; i < amountVCPU; i++){
 		tempMap[i] = -1;
@@ -963,7 +965,7 @@ __phase_1(struct asym_private *prv, struct list_head *active_vcpu){
 			printk("[SCHED_ASYM] Cannot find a propoer physical core for the virtual core\n");
 			break;
 		}
-		//DEBUGMSG("[SCHED_ASYM] choosing cand for vcpu (%i, %i)\n", svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id);
+		//DEBUGMSG("[SCHED_ASYM] vcpu (%i, %i) found a candidate cpu.\n", svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id);
 		
 		/* assign vcpu to pcpu	*/				
 		percentage = 0;
@@ -972,17 +974,16 @@ __phase_1(struct asym_private *prv, struct list_head *active_vcpu){
 			while(tempRes > 0){
 				tempRes -= cand_cpu->info.provRes;
 				percentage++;
-			};
-			//DEBUGMSG("[SCHED_ASYM] percentage = %i\n", percentage);
+			};			
 			cand_cpu->info.workloads[svc->info.vcpuNum] = (unsigned int)(percentage*ASYM_INTERVAL_TS/100);
 			cand_cpu->info.load += (unsigned int)(percentage*ASYM_INTERVAL_TS/100);
-			//DEBUGMSG("[SCHED_ASYM] load = %i\n", cand_cpu->info.load);
+			//DEBUGMSG("[SCHED_ASYM] percentage = %i, load = %i\n", percentage, cand_cpu->info.load);
 			cand_cpu->info.resRemain -= svc->info.requRes;
 			svc->info.requRes = 0;
 			iter_svc = iter_svc->next;
 		}
 		else{
-			printk("[SCHED_ASYM] FULL!\n");
+			//DEBUGMSG("[SCHED_ASYM] Candidate cpu full! Find another one.\n");
 			cand_cpu->info.workloads[svc->info.vcpuNum] = ASYM_INTERVAL_TS - cand_cpu->info.load;
 			svc->info.requRes -= cand_cpu->info.resRemain;
 			cand_cpu->info.resRemain = 0;
@@ -1043,7 +1044,7 @@ __phase_2(struct asym_private *prv, struct list_head* exeSlice, unsigned int amo
 		}
 	}	
 	
-	// DEBUGMSG("[SCHED_ASYM] start OSSP.\n");
+	//DEBUGMSG("[SCHED_ASYM] start OSSP.\n");
 	while(1){
 		/* find lower bound	*/
 		LowerBound = 0;
@@ -1130,7 +1131,8 @@ __phase_2(struct asym_private *prv, struct list_head* exeSlice, unsigned int amo
 		 * Assume that there will be no duplication.
 		 */		
 		list_add_tail(&new_slice->slice_elem, exeSlice);
-	};	
+	};
+	//DEBUGMSG("[SCHED_ASYM] finish OSSP.\n");
 
 	/* free allocated memory in phase 2	*/
 	xfree(decSet.cpuMapping);
@@ -1159,7 +1161,7 @@ __phase_3(struct list_head *exeSlice, struct list_head *exePlan, unsigned int am
 		return;
 	}
 
-	roadMap = xzalloc_array(int, amountVCPU);	
+	roadMap = xzalloc_array(int, amountVCPU);
 	for(int i = 0; i < amountVCPU; i++){
 		roadMap[i] = -1;
 	}
@@ -1246,7 +1248,8 @@ asym_gen_plan(void *dummy){
 
 	/* declarations: final */	
 	struct asym_exeSlice *currSlice;
-	struct asym_vcpuPlan *newPlanElem;	
+	struct asym_vcpuPlan *newPlanElem;
+	struct asym_vcpuPlan *lastPlanElem;	
 	unsigned int now;
 
 	s_time_t now_time = NOW();
@@ -1341,12 +1344,11 @@ asym_gen_plan(void *dummy){
 	/* Phase 3
 	 * 
 	 */
-	__phase_3(&exeSlice, &exePlan, amountPCPU, amountVCPU);
+	__phase_3(&exeSlice, &exePlan, amountPCPU, amountVCPU);	
 	
 	/* finalize	
 	 * assign the whole plan to each virtual core
 	 */	
-
 assign_vcpu:
 	/* clean up the plan_element of each vritual core	*/
 	list_for_each( iter_sdom, &prv->sdom ){
@@ -1378,37 +1380,54 @@ assign_vcpu:
 	/* 
 	 * Assignment of the other vcpu
 	 */	
-	now = 0;
-	while(!list_empty(&exePlan)){		
+	now = 0;	
+	while(!list_empty(&exePlan)){				
 		currSlice = list_entry(exePlan.next, struct asym_exeSlice, slice_elem);
 		for(int i = 0; i < amountPCPU; i++){
 			if(currSlice->mapping[i] != -1){
-				newPlanElem = xzalloc(struct asym_vcpuPlan);				
-				newPlanElem->pcpu = cpuMapping[i];
-				newPlanElem->start_slice = now;
-				newPlanElem->end_slice = now + currSlice->timeslice;
-				/* get corresponding vcpu, and insert the plan */				
-				svc = __fetch_vcpu_num(currSlice->mapping[i], &active_vcpu);
-				if(svc != NULL){
-					while(test_and_set_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags));
-					list_add_tail(&newPlanElem->plan_elem, &svc->info.plan);
-					clear_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags);
+				/* get corresponding vcpu */
+				svc = __fetch_vcpu_num(currSlice->mapping[i], &active_vcpu);				
+				if(svc == NULL){
+					printk("[SCHED_ASYM] Cannot find virtual core %i by number.\n", currSlice->mapping[i]);
+					continue;
+				}
+				lastPlanElem = list_entry(svc->info.plan.prev, struct asym_vcpuPlan, plan_elem);
+				if(lastPlanElem->pcpu == cpuMapping[i]
+					&& lastPlanElem->end_slice == now){
+					lastPlanElem->end_slice = now + currSlice->timeslice;
 				}
 				else{
-					printk("[SCHED_ASYM] Cannot find virtual core %i by number.\n", currSlice->mapping[i]);
+					newPlanElem = xzalloc(struct asym_vcpuPlan);
+					newPlanElem->pcpu = cpuMapping[i];
+					newPlanElem->start_slice = now;
+					newPlanElem->end_slice = now + currSlice->timeslice;
+					/* insert the plan */				
+					
+					while(test_and_set_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags));
+					list_add_tail(&newPlanElem->plan_elem, &svc->info.plan);
+					clear_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags);									
 				}
 			}
 		}
 		now += currSlice->timeslice;
 		list_del_init(exePlan.next);
-	};
+	};	
 
 	/*
-	 * Set the on_cpu of vcpu from DomU
-	 */
-	list_for_each_entry(svc, &active_vcpu, info.act_elem){		
-		svc->vcpu->processor = __plan_elem(svc)->pcpu;		
+	 * Set the processor of each vcpu from DomU
+	 */	
+	/*
+	list_for_each_entry(svc, &active_vcpu, info.act_elem){
+		newPlanElem = __plan_elem(svc);
+		if( newPlanElem != NULL
+			&& newPlanElem->pcpu != svc->vcpu->processor ){
+				DEBUGMSG("runq migrate: should not happen for now.\n");
+			__runq_migrate(svc->vcpu->processor, svc);
+		}
+		svc->vcpu->processor = __plan_elem(svc)->pcpu;
 	}
+	*/
+	
 
 #ifdef ASYM_DEBUG
 	//__dump_plan(prv);
@@ -1491,10 +1510,8 @@ asym_schedule(
 	slice = atomic_read(&prv->cpuArray[cpu]->curr_slice);	
 #endif
 	
-	if(cpu == 4){
-		//DEBUGMSG("[SCHED_ASYM] asym_scheduler()\t cpu %i (slice:%i) was running vcpu (%i, %i).\n", cpu, slice, current->domain->domain_id, current->vcpu_id);
-	}
-
+	//DEBUGMSG("[SCHED_ASYM] asym_scheduler()\t cpu %i (slice:%i) was running vcpu (%i, %i).\n", cpu, slice, current->domain->domain_id, current->vcpu_id);
+	
 	SCHED_STAT_CRANK(schedule);
 
 	clear_bit(ASYM_FLAG_VCPU_YIELD, &scurr->flags);
@@ -1506,7 +1523,6 @@ asym_schedule(
 	 * Else, migrate the vcpu to the next pcpu according to the scheduling plan,
 	 * and fetch the next vcpu from run queue.
 	 */
-
 	/* Tasklet work (which runs in idle VCPU context) overrides all else. */
 	if ( tasklet_work_scheduled )
 	{		
@@ -1515,9 +1531,25 @@ asym_schedule(
 		snext = ASYM_VCPU(idle_vcpu[cpu]);		
 		goto out;
 	}
+
+	/* check if there is any vcpu needs to be miragted first. 
+	 * If so, grab it.
+	 */
+#ifdef PASSIVE_MIGRATION
+	if(!test_bit(_VPF_migrating, &current->pause_flags)){
+		list_for_each( iter, runq ){
+			svc = __runq_elem(iter);
+			if(test_bit(_VPF_migrating, &svc->vcpu->pause_flags)){
+				snext = svc;
+				ret.time = MILLISECS(1);
+				goto out;
+			}
+		}
+	}
+#endif
 	
 	if(test_and_clear_bit(ASYM_FLAG_VCPU_EARLY, &scurr->flags)){
-		DEBUGMSG("[SCHED_ASYM] goto select_next.\n");
+		//DEBUGMSG("[SCHED_ASYM] goto select_next.\n");
 		goto select_next;
 	}
 
@@ -1539,8 +1571,7 @@ asym_schedule(
 
 			/* if scurr is not runnable, pick the next runnable vcpu in the runqueue.
 			 * Execute the runnable vcpu for half of the time slice.
-			 */			
-			DEBUGMSG("[SCHED_ASYM] not runnable.\n");
+			 */						
 			snext = NULL;
 			list_for_each( iter, runq ){
 				svc = __runq_elem(iter);
@@ -1574,22 +1605,17 @@ asym_schedule(
 				plan = __pop_elem(scurr);
 			}
 			
-			if(plan == NULL){
-				/* nowhere to go, put to the end of the queue	*/			
-				// DEBUGMSG("[SCHED_ASYM] vcpu has no plan.\n");
-			}
-			else if(plan->pcpu == cpu){				
-				// DEBUGMSG("[SCHED_ASYM] vcpu should stay on the same pcpu.\n");
-			}
-			else{
-				/* migrate to target pcpu*/		
-				// DEBUGMSG("[SCHED_ASYM] run queue migration.\n");
-				__runq_migrate(cpu, scurr);
+			if(plan != NULL
+				&& plan->pcpu != cpu){
+				/* migrate to target runq*/
+				DEBUGMSG("[SCHED_ASYM] set migrating bit: do_schedule() .\n");
+#ifdef PASSIVE_MIGRATION
+				set_bit(_VPF_migrating, &scurr->vcpu->pause_flags);
+#else
+				__runq_migrate(plan->pcpu, scurr);
+#endif
 			}					
 		}	
-	}
-	else{		
-		// DEBUGMSG("[SCHED_ASYM] IDLE.\n");
 	}
 	
 	/*
@@ -1606,7 +1632,6 @@ select_next:
 				break;
 		}		
 	}
-	//snext = __runq_elem(runq->next);
 	
 	/* If its start_time is less or equal to curr_slice, start the execution
 	 * else, idle for a time slice
@@ -1614,16 +1639,22 @@ select_next:
 	if( unlikely(snext == NULL) ){
 		/* empty runqueue or no vcpu to execute */
 		snext = ASYM_VCPU(idle_vcpu[cpu]);
-	}
+	}/*
+	else if( !vcpu_runnable(snext->vcpu) ){
+		snext = ASYM_VCPU(idle_vcpu[cpu]);
+		ret.time = MILLISECS(2);
+	}*/
 	else{
 		/* migrate if the next vcpu is not on this pcpu. */
-		if ( snext->vcpu->processor != cpu ){				
-			snext->vcpu->processor = cpu;
-			//set_bit(_VPF_migrating, &snext->vcpu->pause_flags);
-			ret.migrated = 1;				
+		if ( snext->vcpu->processor != cpu ){
 			printk("[SCHED_ASYM] Should migrate vcpu %i from %i to %i.\n", 
-				snext->info.vcpuNum, snext->vcpu->processor, cpu);				
-		}
+				snext->info.vcpuNum, snext->vcpu->processor, cpu);
+#ifndef PASSIVE_MIGRATION
+			snext->vcpu->processor = cpu;
+			//set_bit(_VPF_migrating, &scurr->vcpu->pause_flags);
+			ret.migrated = 1;
+#endif
+		}		
 	}
 
 out:
@@ -1632,6 +1663,27 @@ out:
 	atomic_inc(&prv->cpuArray[cpu]->curr_slice);
 #endif
 	return ret;	 
+}
+static void
+asym_migrate(const struct scheduler *ops, struct vcpu *vc, unsigned int new_cpu){
+
+#ifdef PASSIVE_MIGRATION
+	struct asym_vcpu * const svc = ASYM_VCPU(vc);
+
+	// migrate runqueue here
+	__runq_migrate(new_cpu, svc);
+	clear_bit(_VPF_migrating, &vc->pause_flags);
+#endif
+	vc->processor = new_cpu;
+
+	DEBUGMSG("[SCHED_ASYM] asym_migrate():vcpu (%i, %i) from cpu %i to %i.\n", vc->domain->domain_id, vc->vcpu_id, vc->processor, new_cpu);
+}
+
+static void
+asym_context_saved(const struct scheduler *ops, struct vcpu *vc)
+{
+	if ( unlikely(test_bit(_VPF_migrating, &vc->pause_flags)) )
+		DEBUGMSG("[SCHED_ASYM] asym_context_saved():vcpu (%i, %i) should trigger vcpu_migrate.\n", vc->domain->domain_id, vc->vcpu_id);
 }
 
 static void
@@ -1645,10 +1697,9 @@ asym_dump_vcpu(struct asym_vcpu *svc)
 		return;
 	}
 
-   	printk("[SCHED_ASYM] (%i.%i) on_cpu=%i\n",// actual_cpu=%i\n",
+   	printk("[SCHED_ASYM] (%i.%i) on_cpu=%i\n",
             svc->vcpu->domain->domain_id,
-            svc->vcpu->vcpu_id,
-            //svc->on_cpu,            
+            svc->vcpu->vcpu_id,            
             svc->vcpu->processor);    
 }
 
@@ -1806,4 +1857,7 @@ const struct scheduler sched_asym_def = {
 	.free_pdata     = asym_free_pdata,
 	.alloc_domdata  = asym_alloc_domdata,
 	.free_domdata   = asym_free_domdata,    
+	
+	.context_saved  = asym_context_saved,
+	.migrate		= asym_migrate,
 };
