@@ -52,7 +52,7 @@
 #define DEBUGMSG(msg, arg...)
 #endif
 
-#define TICK_TIMER	/* use timer to count time slice */
+#define TIMER_PER_CORE	/* use timer to count time slice */
 
 /* From xen/common/vcpu_freq.c by Isaac	*/
 #define NUM_DOMAIN	16
@@ -77,12 +77,12 @@ extern uint64_t freq_amp[NUM_DOMAIN][MAX_VCPU];
  * Physical CPU
  */
 //DEFINE_PER_CPU(type, name);
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 DEFINE_PER_CPU(unsigned int, curr_slice);
 #endif
 struct asym_pcpu {
 	struct list_head runq;
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 	struct timer ticker;
 #else
 	atomic_t curr_slice;      /* record current time slice in an interval     */
@@ -105,8 +105,7 @@ struct asym_vcpu {
 	/* Up-pointers	*/
 	struct asym_dom *sdom;
 	struct vcpu *vcpu;
-	unsigned flags;
-	//unsigned int on_cpu;
+	unsigned flags;	
 	/* for scheduling algorithm*/
 	struct asym_vcpuinfo{
 		unsigned int vcpuNum;
@@ -170,7 +169,7 @@ struct asym_vcpuPlan{
 	unsigned int end_slice;
 	struct list_head plan_elem;	/* on the plan list*/
 };
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 static void asym_tick(void *_cpu);
 #endif
 static void asym_gen_plan(void *dummy);
@@ -214,9 +213,7 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
 		vcpu_start = planElem->start_slice;
 		/* list_for_each(pos, head)  */
 		list_for_each( iter, runq )
-		{
-			//struct asym_vcpu * iter_svc = __runq_elem(iter);
-			//planElem = __plan_elem(iter_svc);
+		{			
 			planElem = __plan_elem(__runq_elem(iter));
 			if(planElem != NULL){
 				curr_start = planElem->start_slice;
@@ -430,7 +427,7 @@ asym_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
 		list_del_init(&svc->runq_elem);
 	};
 	/* remove timer */
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 	kill_timer(&spc->ticker);
 #endif
 	if (prv->master_timer == cpu){
@@ -464,7 +461,7 @@ asym_alloc_pdata(const struct scheduler *ops, int cpu)
 		set_timer(&prv->timer_gen_plan,
 			NOW() + MILLISECS(ASYM_INTERVAL_TS*ASYM_TIMESLICE_MS));
 	}
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 	init_timer(&spc->ticker, asym_tick, (void *)(unsigned long)cpu, cpu);
 	set_timer(&spc->ticker, NOW() + MILLISECS(ASYM_TIMESLICE_MS) );
 	/* set per-CPU timeslice */
@@ -1450,7 +1447,7 @@ assign_vcpu:
 		/* */
 		__runq_check(i);
 		/* */
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 		per_cpu(curr_slice, i) = 0;
 #else
 		if(prv->cpuArray[i] != NULL){
@@ -1468,7 +1465,7 @@ assign_vcpu:
 
 }
 /* Increase current slice number of each physical core	*/
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 static void
 asym_tick(void *_cpu)
 {
@@ -1478,6 +1475,8 @@ asym_tick(void *_cpu)
 	set_timer(&spc->ticker, NOW() + MILLISECS(ASYM_TIMESLICE_MS) );
 
 	this_cpu(curr_slice)++;
+
+	//cpu_raise_softirq(cpu, SCHEDULE_SOFTIRQ);
 }
 #endif
 
@@ -1503,8 +1502,9 @@ asym_schedule(
 	struct asym_vcpuPlan *plan;
 	struct list_head *iter;
 	unsigned int slice;
+	s_time_t tslice = 0;
 
-#ifdef TICK_TIMER
+#ifdef TIMER_PER_CORE
 	slice = this_cpu(curr_slice);
 #else	
 	slice = atomic_read(&prv->cpuArray[cpu]->curr_slice);	
@@ -1515,7 +1515,7 @@ asym_schedule(
 	SCHED_STAT_CRANK(schedule);
 
 	clear_bit(ASYM_FLAG_VCPU_YIELD, &scurr->flags);
-	ret.time = MILLISECS(ASYM_TIMESLICE_MS);
+	tslice = MILLISECS(ASYM_TIMESLICE_MS);	
 	ret.migrated = 0;
 			
 	/* First, compare the end_time of current running vcpu with the curr_slice
@@ -1528,7 +1528,7 @@ asym_schedule(
 	{		
 		printk("[SCHED_ASYM] tasklet_work_scheduled = true\n");
 		clear_bit(ASYM_FLAG_VCPU_EARLY, &scurr->flags);
-		snext = ASYM_VCPU(idle_vcpu[cpu]);		
+		snext = ASYM_VCPU(idle_vcpu[cpu]);
 		goto out;
 	}
 
@@ -1541,37 +1541,39 @@ asym_schedule(
 			svc = __runq_elem(iter);
 			if(test_bit(_VPF_migrating, &svc->vcpu->pause_flags)){
 				snext = svc;
-				ret.time = MILLISECS(1);
+				tslice = MILLISECS(1);
 				goto out;
 			}
 		}
 	}
 #endif
 	
-	if(test_and_clear_bit(ASYM_FLAG_VCPU_EARLY, &scurr->flags)){
-		//DEBUGMSG("[SCHED_ASYM] goto select_next.\n");
+	/* if scurr is borrowed from the queue,
+	 * fetch the next vcpu directly.
+	 */
+	if(test_and_clear_bit(ASYM_FLAG_VCPU_EARLY, &scurr->flags)){		
 		goto select_next;
 	}
 
-	/* if scurr is idle, do nothing and fetch the next vcpu directly. */
+	/* if scurr is idle, do nothing and fetch the next vcpu directly. 
+	 * if not, check if the scheduler can run it in the next time slice.
+	 */
 	if( !is_idle_vcpu(current) ){		
 		plan = __plan_elem(scurr);
-		/* if runnable and can run on current time slice
-		 * snext = scurr;
-		 */
+		
 		if( vcpu_runnable(current)
 			&& plan != NULL
 			&& __in_range(plan, slice)){
+			/* if runnable and can run on current time slice */		 
 			snext = scurr;
 			goto out;
 		}
 		else if( !vcpu_runnable(current) 
 			&& plan != NULL
 			&& __in_range(plan, slice)){
-
-			/* if scurr is not runnable, pick the next runnable vcpu in the runqueue.
-			 * Execute the runnable vcpu for half of the time slice.
-			 */						
+			/* if scurr is not runnable, but still in its assigning time slice.
+			 * Borrow the next runnable vcpu in the runqueue and execute for half of the time slice.
+			 */							
 			snext = NULL;
 			list_for_each( iter, runq ){
 				svc = __runq_elem(iter);
@@ -1582,22 +1584,24 @@ asym_schedule(
 			}
 			if(snext != NULL){
 				set_bit(ASYM_FLAG_VCPU_EARLY, &snext->flags);
-				ret.time /= 2;
+				tslice /= 2;				
 			}
 			else{			
-			/*
-			 * If no runnable vcpu available, should idle.
+			/* If no runnable vcpu available, should idle.
 			 * But idle will cause long booting time.
-			 * snext = scurr anyway...
-			 */
+			 * [TODO] snext = scurr anyway...
+			 */	
+				//if(scurr->vcpu->domain->domain_id != 0)
+				//	printk("[SCHED_ASYM] vcpu (%i,%i)\n", scurr->vcpu->domain->domain_id, scurr->vcpu->vcpu_id);
 				//snext = ASYM_VCPU(idle_vcpu[cpu]);
+				//tslice /= 10;
 				snext = scurr;
 			}
 			goto out;
 		}
 		else{			
 			/* vcpu either with no plan or not in executable range
-			 * deal with scurr 
+			 * deal with scurr and then select the next vcpu later
 			 */
 			if(plan != NULL
 				&& plan->end_slice <= slice){
@@ -1658,8 +1662,9 @@ select_next:
 	}
 
 out:
-	ret.task = snext->vcpu;
-#ifndef TICK_TIMER
+	ret.task = snext->vcpu;	
+	ret.time = tslice;
+#ifndef TIMER_PER_CORE
 	atomic_inc(&prv->cpuArray[cpu]->curr_slice);
 #endif
 	return ret;	 
