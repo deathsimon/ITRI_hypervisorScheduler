@@ -41,10 +41,11 @@
 #define ASYM_FLAG_VCPU_YIELD	0x1	/* VCPU yielding */
 #define ASYM_FLAG_VCPU_LOCK	0x2	/* VCPU lock */
 #define ASYM_FLAG_VCPU_EARLY	0x4 /* execute the VPCU earlier since the current one is not runnable */
+#define ASYM_FLAG_VCPU_MIGRATE	0x8	
 
 //#define	ASYM_DEBUG
 
-//#define PASSIVE_MIGRATION
+#define PASSIVE_MIGRATION
 
 #ifdef	ASYM_DEBUG
 #define DEBUGMSG(msg, arg...)	printk(msg, ##arg)
@@ -198,6 +199,10 @@ __runq_insert(unsigned int cpu, struct asym_vcpu *svc)
 	unsigned int vcpu_start, curr_start;
 	struct asym_vcpuPlan* planElem = NULL;
 
+	if(__vcpu_on_runq(svc)){
+		printk("[SCHED_ASYM] vcpu(%i,%i) on cpu %i should be inserted to the runq of cpu %i, but still on the runq.\n",
+				svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id, svc->vcpu->processor, cpu);
+	}
 	BUG_ON( __vcpu_on_runq(svc) );
 	//BUG_ON( cpu != svc->vcpu->processor );
 
@@ -251,18 +256,23 @@ __runq_tickle(unsigned int cpu, struct asym_vcpu *new)
 static inline void
 __runq_migrate(unsigned int target, struct asym_vcpu *svc)
 {
+	set_bit(ASYM_FLAG_VCPU_MIGRATE, &svc->flags);
+
 	if ( __vcpu_on_runq(svc) )
 		__runq_remove(svc);
 	
-	/*
-	DEBUGMSG("[SCHED_ASYM] migrate vcore (%i, %i) from %i to %i.\n", 
-		svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id, sorurce, target );	
-	*/
-#ifndef PASSIVE_MIGRATION
+	printk("[SCHED_ASYM] __runq_migrate() : migrate vcore (%i, %i) from %i to %i.\n", 
+		svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id, svc->vcpu->processor, target );	
+
+#ifdef PASSIVE_MIGRATION
+	set_bit(_VPF_migrating, &svc->vcpu->pause_flags);
+#else
 	svc->vcpu->processor = target;
 #endif
 	__runq_insert(target, svc);
 	__runq_tickle(target, svc);
+
+	clear_bit(ASYM_FLAG_VCPU_MIGRATE, &svc->flags);
 }
 static inline void
 __runq_check(unsigned int cpu)
@@ -278,13 +288,7 @@ __runq_check(unsigned int cpu)
 		planElem = __plan_elem(iter_svc);
 		if(planElem != NULL
 			&& planElem->pcpu != cpu){
-#ifdef PASSIVE_MIGRATION
-			DEBUGMSG("[SCHED_ASYM] set migrating bit: runq_check.\n");
-			set_bit(_VPF_migrating, &iter_svc->vcpu->pause_flags);
-			__runq_tickle(cpu, iter_svc);
-#else
 			__runq_migrate(planElem->pcpu, iter_svc);
-#endif
 		}
 	}
 }
@@ -524,6 +528,7 @@ asym_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
 	clear_bit(ASYM_FLAG_VCPU_YIELD, &svc->flags);
 	clear_bit(ASYM_FLAG_VCPU_LOCK, &svc->flags);
 	clear_bit(ASYM_FLAG_VCPU_EARLY, &svc->flags);
+	clear_bit(ASYM_FLAG_VCPU_MIGRATE, &svc->flags);
 
 	/* If not idle vcpu, insert to domain */
 	if(svc->sdom != NULL){		
@@ -598,13 +603,10 @@ asym_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
 
 	SCHED_STAT_CRANK(vcpu_sleep);
 
-	BUG_ON( is_idle_vcpu(vc) );
-
-	//DEBUGMSG("[SCHED_ASYM] vcpu_sleep() is called by vcpu %i of domain %i.\n", vc->vcpu_id, vc->domain->domain_id);
+	BUG_ON( is_idle_vcpu(vc) );	
 
 	if ( curr_on_cpu(vc->processor) == vc ){
-		/* if running on pcpu	*/
-		DEBUGMSG("[SCHED_ASYM] cpu_raise_softirq() in asym_vcpu_sleep()\n");
+		/* if running on pcpu	*/		
 		cpu_raise_softirq(vc->processor, SCHEDULE_SOFTIRQ);	
 	}
 	else if ( __vcpu_on_runq(svc) ){
@@ -632,8 +634,8 @@ asym_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
 		//return;
 	}
 
-	DEBUGMSG("[SCHED_ASYM] vcpu_wake(): vcpu %i of domain %i on cpu %i,\n", vc->vcpu_id, vc->domain->domain_id, cpu);
-	DEBUGMSG("\t called by vcpu %i of domain %i\n", current->vcpu_id, current->domain->domain_id);
+	//DEBUGMSG("[SCHED_ASYM] vcpu_wake(): vcpu %i of domain %i on cpu %i,\n", vc->vcpu_id, vc->domain->domain_id, cpu);
+	//DEBUGMSG("\t called by vcpu %i of domain %i\n", current->vcpu_id, current->domain->domain_id);
 
 	if ( likely(vcpu_runnable(vc)) ){		
 		SCHED_STAT_CRANK(vcpu_wake_runnable);
@@ -643,7 +645,8 @@ asym_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
 	}
 
 	/*  Put the VCPU into the runq, and tirgger the re-scheduling on the cpu	*/	
-	if(!__vcpu_on_runq(svc)){
+	if(!test_bit(ASYM_FLAG_VCPU_MIGRATE, &svc->flags) 
+		&& !__vcpu_on_runq(svc)){
 		__runq_insert(cpu, svc);
 	}
 	if(is_idle_vcpu(curr_on_cpu(cpu))){
@@ -1505,7 +1508,9 @@ asym_schedule(
 	
 	SCHED_STAT_CRANK(schedule);
 
-	clear_bit(ASYM_FLAG_VCPU_YIELD, &scurr->flags);
+	if(test_and_clear_bit(ASYM_FLAG_VCPU_YIELD, &scurr->flags)){
+		DEBUGMSG("[SCHED_ASYM] vcpu (%i,%i) has yield bit on.\n", current->domain->domain_id, current->vcpu_id);
+	}
 	tslice = MILLISECS(ASYM_TIMESLICE_MS);	
 	ret.migrated = 0;
 			
@@ -1523,22 +1528,6 @@ asym_schedule(
 		goto out;
 	}
 
-	/* check if there is any vcpu needs to be miragted first. 
-	 * If so, grab it.
-	 */
-#ifdef PASSIVE_MIGRATION
-	if(!test_bit(_VPF_migrating, &current->pause_flags)){
-		list_for_each( iter, runq ){
-			svc = __runq_elem(iter);
-			if(test_bit(_VPF_migrating, &svc->vcpu->pause_flags)){
-				snext = svc;
-				tslice = MILLISECS(1);
-				goto out;
-			}
-		}
-	}
-#endif
-	
 	/* if scurr is borrowed from the queue,
 	 * fetch the next vcpu directly.
 	 */
@@ -1567,7 +1556,7 @@ asym_schedule(
 			 */
 
 			/* why not runnable */				
-			//printk("[ASYM_SCHED] vcpu (%i,%i) with flag = %lx \n",current->domain->domain_id, current->vcpu_id, current->pause_flags);
+			DEBUGMSG("[ASYM_SCHED] vcpu (%i,%i) with flag = %lx \n",current->domain->domain_id, current->vcpu_id, current->pause_flags);
 
 			snext = NULL;
 			list_for_each( iter, runq ){
@@ -1582,15 +1571,7 @@ asym_schedule(
 				tslice /= 2;				
 			}
 			else{			
-			/* If no runnable vcpu available, should idle.
-			 * But idle will cause long booting time.
-			 * [TODO] snext = scurr anyway...
-			 */	
-				//if(scurr->vcpu->domain->domain_id != 0)
-				//	printk("[SCHED_ASYM] vcpu (%i,%i)\n", scurr->vcpu->domain->domain_id, scurr->vcpu->vcpu_id);
 				snext = ASYM_VCPU(idle_vcpu[cpu]);
-				//tslice /= 10;
-				//snext = scurr;
 			}
 			goto out;
 		}
@@ -1607,12 +1588,7 @@ asym_schedule(
 			if(plan != NULL
 				&& plan->pcpu != cpu){
 				/* migrate to target runq*/
-				DEBUGMSG("[SCHED_ASYM] set migrating bit: do_schedule() .\n");
-#ifdef PASSIVE_MIGRATION
-				set_bit(_VPF_migrating, &scurr->vcpu->pause_flags);
-#else
 				__runq_migrate(plan->pcpu, scurr);
-#endif
 			}
 		}	
 	}
@@ -1639,28 +1615,23 @@ select_next:
 		/* empty runqueue or no vcpu to execute */
 		snext = ASYM_VCPU(idle_vcpu[cpu]);
 	}
-	else{
-		/* remove snext from runq */
-		//__runq_remove(snext);
-
+	else{		
 		/* migrate if the next vcpu is not on this pcpu. */
 		if ( snext->vcpu->processor != cpu ){
 			printk("[SCHED_ASYM] Should migrate vcpu %i from %i to %i.\n", 
 				snext->info.vcpuNum, snext->vcpu->processor, cpu);
-#ifndef PASSIVE_MIGRATION
+#ifdef PASSIVE_MIGRATION
+			set_bit(_VPF_migrating, &snext->vcpu->pause_flags);
 			snext->vcpu->processor = cpu;
-			//set_bit(_VPF_migrating, &scurr->vcpu->pause_flags);
 			ret.migrated = 1;
+#else
+			printk("[SCHED_ASYM] This should not happened since we already move the cpu in __runq_migrate().\n");
+			BUG_ON(snext->vcpu->processor != cpu);
 #endif
 		}		
 	}
 
-out:
-	if(!is_idle_vcpu(current)
-		&& scurr != snext){
-		/* [TODO] put scurr back into runqueue */
-
-	}
+out:	
 	ret.task = snext->vcpu;	
 	ret.time = tslice;
 #ifndef TIMER_PER_CORE
@@ -1672,22 +1643,29 @@ static void
 asym_migrate(const struct scheduler *ops, struct vcpu *vc, unsigned int new_cpu){
 
 #ifdef PASSIVE_MIGRATION
-	struct asym_vcpu * const svc = ASYM_VCPU(vc);
+	//struct asym_vcpu * const svc = ASYM_VCPU(vc);
 
 	// migrate runqueue here
-	__runq_migrate(new_cpu, svc);
-	clear_bit(_VPF_migrating, &vc->pause_flags);
+	//__runq_migrate(new_cpu, svc);
+	
 #endif
-	vc->processor = new_cpu;
-
-	DEBUGMSG("[SCHED_ASYM] asym_migrate():vcpu (%i, %i) from cpu %i to %i.\n", vc->domain->domain_id, vc->vcpu_id, vc->processor, new_cpu);
+	printk("[SCHED_ASYM] asym_migrate():");
+	
+	if(vc->processor != new_cpu){
+		printk("migrate vcpu (%i, %i) from cpu %i to %i.\n", vc->domain->domain_id, vc->vcpu_id, vc->processor, new_cpu);
+		vc->processor = new_cpu;
+	}
+	else{
+		printk("do nothing.\n");
+	}
 }
 
 static void
 asym_context_saved(const struct scheduler *ops, struct vcpu *vc)
 {
-	if ( unlikely(test_bit(_VPF_migrating, &vc->pause_flags)) )
-		DEBUGMSG("[SCHED_ASYM] asym_context_saved():vcpu (%i, %i) should trigger vcpu_migrate.\n", vc->domain->domain_id, vc->vcpu_id);
+	//DEBUGMSG("[SCHED_ASYM] asym_context_saved().\n");
+	//if ( unlikely(test_bit(_VPF_migrating, &vc->pause_flags)) )
+	//	DEBUGMSG("[SCHED_ASYM] asym_context_saved():vcpu (%i, %i) should trigger vcpu_migrate.\n", vc->domain->domain_id, vc->vcpu_id);
 }
 
 static void
