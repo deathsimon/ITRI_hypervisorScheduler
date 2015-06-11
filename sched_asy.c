@@ -26,7 +26,7 @@
 #define	TYPE_PERFORMANCE			0
 #define	TYPE_EFFICIENCY				1
 
-#define	FREQ_PERFORMANCE			57600	/* KHz	*/
+#define	FREQ_PERFORMANCE			38400	/* KHz	*/
 #define	FREQ_EFFICIENCY				19200
 #define FREQ_MINIMUM				FREQ_EFFICIENCY/4
 
@@ -1198,7 +1198,8 @@ __phase_3(struct list_head *exeSlice, struct list_head *exePlan, unsigned int am
 		}
 		if(minIncrease != numSwitching){
 			// something wrong
-			printk("[SCHED_ASYM] Switching time anomaly\n");
+			printk("[SCHED_ASYM] Switching time anomaly: minInc = %i, numSwitch = %i\n",
+				minIncrease, numSwitching);			
 		}
 				
 		/* remove from queue and insert candSlice into plan	*/
